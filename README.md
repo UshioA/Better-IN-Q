@@ -55,3 +55,7 @@ py -3 tools/make_zip.py   # 打发布包
 | `src/config.*` / `src/input.*` / `src/gamedata.*` | 配置文件、快捷键、任务表 |
 | `tests/` | 单元测试（`build.sh all` 会跑） |
 | `third_party/imgui/` | [Dear ImGui](https://github.com/ocornut/imgui)（MIT 许可，见其中的 LICENSE.txt） |
+
+## 许可证
+
+[MIT](LICENSE)。`third_party/imgui/` 是 Dear ImGui，按它自己的 MIT 许可（版权归其作者）。
