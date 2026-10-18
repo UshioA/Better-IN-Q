@@ -12,6 +12,7 @@
 #include "../src/overlay.h"
 #include "../src/padfilter.h"
 #include "../src/ui.h"
+#include "../src/i18n.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 
@@ -73,35 +74,10 @@ int wmain(int argc, wchar_t** argv)
     // ---------------- 手柄过滤器 ----------------
     std::printf("== padfilter\n");
     const unsigned short V = XINPUT_GAMEPAD_BACK, M = XINPUT_GAMEPAD_START, A = XINPUT_GAMEPAD_A;
-    padfilter::SetChord(V | M);
     XINPUT_STATE s;
-    Pad(s, A); padfilter::TestFilter(0, &s);
-    CHECK(s.Gamepad.wButtons == A, "不在组合里的键原样放行");
-    Pad(s, 0); padfilter::TestFilter(0, &s);
-    Pad(s, V); padfilter::TestFilter(0, &s);
-    CHECK(s.Gamepad.wButtons == 0, "刚按下视图键：先扣住");
-    Pad(s, V | M); padfilter::TestFilter(0, &s);
-    CHECK(s.Gamepad.wButtons == 0, "凑齐视图+菜单：游戏收不到");
-    Pad(s, V); padfilter::TestFilter(0, &s);
-    CHECK(s.Gamepad.wButtons == 0, "组合松开一半：还是扣着");
-    Pad(s, 0); padfilter::TestFilter(0, &s);
-    CHECK(s.Gamepad.wButtons == 0, "全松开：没有补发（组合不算点按）");
-
-    Pad(s, M); padfilter::TestFilter(0, &s);
-    CHECK(s.Gamepad.wButtons == 0, "单按菜单键：先扣住");
-    Pad(s, 0); padfilter::TestFilter(0, &s);
-    CHECK(s.Gamepad.wButtons == M, "100ms 内松开：补发一次点按（第 1 拍）");
-    int pulses = 1;
-    for (int k = 0; k < 6; ++k) { Pad(s, 0); padfilter::TestFilter(0, &s); if (s.Gamepad.wButtons == M) ++pulses; }
-    CHECK(pulses == 4, "补发持续 4 拍（实际 %d）", pulses);
-
-    Pad(s, M); padfilter::TestFilter(0, &s);
-    ::Sleep(130);
-    Pad(s, M); padfilter::TestFilter(0, &s);
-    CHECK(s.Gamepad.wButtons == M, "按住超过 100ms：放行给游戏（开菜单）");
-    Pad(s, M | V); padfilter::TestFilter(0, &s);
-    CHECK((s.Gamepad.wButtons & M) == M, "已经放行后再凑组合：不再拦（游戏那边菜单已经开了）");
-    Pad(s, 0); padfilter::TestFilter(0, &s);
+    Pad(s, A | XINPUT_GAMEPAD_DPAD_UP);
+    padfilter::TestFilter(0, &s);
+    CHECK(s.Gamepad.wButtons == (A | XINPUT_GAMEPAD_DPAD_UP), "面板关着：手柄状态原样给游戏（不扣留任何键）");
 
     padfilter::SetBlock(true);
     Pad(s, A | XINPUT_GAMEPAD_DPAD_UP); s.Gamepad.bRightTrigger = 255; s.Gamepad.sThumbLX = 30000;
@@ -148,6 +124,7 @@ int wmain(int argc, wchar_t** argv)
 
     std::string err;
     LoadConfig(L"config\\BetterINQ.ini", g_cfg, err);
+    i18n::Set(i18n::FromString(g_cfg.language));   // 面板语言跟着配置走，和 DLL 里一样
     g_model.cfg = &g_cfg;
     g_model.ready = true;
     g_model.version = "0.2";
@@ -185,6 +162,14 @@ int wmain(int argc, wchar_t** argv)
         if (i == 2) g_shot = out + L"\\overlay_settings.png";
         frame(0.25f, 0.35f, 0.25f);
     }
+    // 看样子用：从原版 IN-Q 导入的文件选择框
+    ui::DebugOpenPick();
+    for (int i = 0; i < 8; ++i) {
+        if (i == 7) g_shot = out + L"\\overlay_pick.png";
+        frame(0.25f, 0.35f, 0.25f);
+    }
+    ui::DebugClosePick();
+    for (int i = 0; i < 4; ++i) frame(0.25f, 0.35f, 0.25f);
     ui::DebugGo(3, 0);
     for (int i = 0; i < 30; ++i) {
         if (i == 29) g_shot = out + L"\\overlay_setedit.png";
@@ -198,6 +183,17 @@ int wmain(int argc, wchar_t** argv)
         frame(0.25f, 0.35f, 0.25f);
     }
     for (int i = 0; i < 30; ++i) frame(0.25f, 0.35f, 0.25f);
+    // 看样子用：假名搜索过滤「换任务」（でんせつ 只该剩下 伝説の黒龍 这一类的任务）
+    ui::DebugGo(1, 0);
+    for (int i = 0; i < 20; ++i) frame(0.25f, 0.35f, 0.25f);
+    ui::DebugSetSearch("でんせつ");
+    for (int i = 0; i < 4; ++i) {
+        if (i == 3) g_shot = out + L"\\overlay_search.png";
+        frame(0.25f, 0.35f, 0.25f);
+    }
+    ui::DebugSetSearch("");
+    ui::DebugGo(0, 0);
+    for (int i = 0; i < 10; ++i) frame(0.25f, 0.35f, 0.25f);
     // 进程里还有别人建的 D3D11 交换链（别的模组、工具窗口）：同一张虚表，Present 也会走到钩子里，
     // 但面板只能画在游戏自己的交换链上
     {

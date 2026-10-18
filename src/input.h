@@ -32,6 +32,10 @@ std::string PadComboSpec(unsigned mask, std::string& why);
 std::string KeyComboSpec(const std::vector<int>& vks, std::string& why);
 
 // 每帧调一次，返回这一帧是不是刚按下。只在游戏窗口在前台时生效。
+// 诊断用：我们自己调了几次 XInput（新版应该接近 0，状态改从游戏自己的读取里拿）
+int PollCalls();
+
+
 class Input {
 public:
     bool Init();

@@ -34,7 +34,8 @@ int main()
     std::string err;
     CHECK(LoadConfig(def, c, err), "不存在时生成默认配置并读入");
     CHECK(c.hkRestart == "LB+RB+LT+RT", "默认重开键 = %s", c.hkRestart.c_str());
-    CHECK(c.hkPanel == "View+Menu | Insert", "默认面板键 = %s", c.hkPanel.c_str());
+    CHECK(c.hkPanel == "Insert", "默认面板键 = %s", c.hkPanel.c_str());
+    CHECK(c.hkResetOnly.empty(), "默认没有只重置键（用面板按钮）");
     CHECK(c.quickBlackout && c.questId == 0 && c.sets.empty(), "默认开关");
     ::DeleteFileW(def.c_str());
 
@@ -101,8 +102,9 @@ int main()
     {
         Config a;
         a.questId = 66845; a.reset = true; a.acceptOnly = false; a.wyvern = true;
-        a.activeSet = "米拉"; a.food = 2; a.quickBlackout = false; a.panelOpacity = 65;
-        a.hkRestart = "LB+RB+LT+RT | Ctrl+R"; a.hkPanel = "View+Menu | Insert";
+        a.activeSet = "米拉"; a.food = 2; a.quickBlackout = false; a.panelOpacity = 65; a.language = "ja";
+        a.hkRestart = "LB+RB+LT+RT | Ctrl+R"; a.hkPanel = "View+Menu | Insert"; a.hkResetOnly = "Ctrl+Alt+R";
+        a.debugDisable = "kbd,din";
         LoadoutSet s1; s1.name = "米拉"; s1.equip = "米拉"; s1.item = "米拉2"; s1.linkRadial = true; s1.food = 2; s1.quest = 66845;
         LoadoutSet s2; s2.name = "空的";
         a.sets = {s1, s2};
@@ -114,8 +116,10 @@ int main()
         Config b;
         CHECK(LoadConfig(rp, b, err), "读回来");
         CHECK(b.questId == 66845 && b.reset && !b.acceptOnly && b.wyvern && b.activeSet == "米拉" && b.food == 2 &&
-              !b.quickBlackout && b.panelOpacity == 65, "[General] 一致");
-        CHECK(b.hkRestart == a.hkRestart && b.hkPanel == a.hkPanel, "[Hotkeys] 一致");
+              !b.quickBlackout && b.panelOpacity == 65 && b.language == "ja", "[General] 一致（含 Language）");
+        CHECK(b.hkRestart == a.hkRestart && b.hkPanel == a.hkPanel && b.hkResetOnly == a.hkResetOnly &&
+              b.debugDisable == a.debugDisable,
+              "[Hotkeys] 一致（含 ResetOnly）");
         CHECK(b.sets.size() == 2 && b.sets[0].name == "米拉" && b.sets[0].equip == "米拉" && b.sets[0].item == "米拉2" &&
               b.sets[0].linkRadial && b.sets[0].food == 2 && b.sets[0].quest == 66845 &&
               b.sets[1].name == "空的" && b.sets[1].equip.empty(), "全套一致（含空套装）");

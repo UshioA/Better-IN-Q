@@ -45,7 +45,9 @@ bool InitArena(std::uintptr_t lo, std::uintptr_t hi, std::size_t size)
     const std::uintptr_t gran = si.dwAllocationGranularity;   // 64KB
 
     // 先往模块下面找（CT 用的就是 0x13FF80000），再往上面找。整段都要在 rel32 内。
-    const std::uintptr_t span = 0x70000000;   // 留余量，别贴着 2GB 边
+    // 2026-07: 有的机器上 ±1.75GB 里一个 64KB 的空洞都没有（4K + DX12 + Steam 壳），
+    // 于是扫完再用「让系统随便给、自己验距离」兜一下（见函数末尾）。
+    const std::uintptr_t span = 0x7F000000;   // 留余量，别贴着 2GB 边
     for (std::uintptr_t a = (lo - gran) & ~(gran - 1); a > gran && lo - a < span; a -= gran) {
         if (!InRel32(a, hi) || !InRel32(a + size, lo)) continue;
         if (std::uintptr_t p = TryAllocAt(a, size)) { g_arena = p; break; }
@@ -54,6 +56,17 @@ bool InitArena(std::uintptr_t lo, std::uintptr_t hi, std::size_t size)
         for (std::uintptr_t a = (hi + gran) & ~(gran - 1); a - hi < span; a += gran) {
             if (!InRel32(lo, a + size)) break;
             if (std::uintptr_t p = TryAllocAt(a, size)) { g_arena = p; break; }
+        }
+    }
+    if (!g_arena) {
+        // 64KB 网格扫不到，不代表没有：地址空间里可能只剩不落在网格上的缝。
+        // VirtualAlloc(nullptr) 让系统自己挑，挑到哪算哪，验一下 rel32，不在就还回去。
+        for (int i = 0; i < 64 && !g_arena; ++i) {
+            void* p = ::VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+            if (!p) break;
+            const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(p);
+            if (InRel32(a, hi) && InRel32(a + size, lo)) g_arena = a;
+            else ::VirtualFree(p, 0, MEM_RELEASE);
         }
     }
     if (!g_arena) return false;

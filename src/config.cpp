@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "i18n.h"
+
 namespace {
 
 std::string Trim(const std::string& s)
@@ -60,37 +62,94 @@ std::string Render(const Config& c)
     };
     auto num = [](int v) { return std::to_string(v); };
     std::string o = "\xEF\xBB\xBF";
-    o += "; Better-IN-Q 配置。面板里改的设置会自动存回这里；手改的话下次进游戏生效。\r\n\r\n";
+    o += i18n::Tr("; Better-IN-Q 配置。面板里改的设置会自动存回这里；手改的话下次进游戏生效。\r\n\r\n",
+                  "; Better-IN-Q settings. Changes made in the panel are written back here;\r\n"
+                  "; if you edit by hand they take effect on the next launch.\r\n\r\n",
+                  "; Better-IN-Q の設定。パネルで変えた内容はここに保存されます。\r\n"
+                  "; 手で編集した場合は次回起動時に反映されます。\r\n\r\n");
     o += "[General]\r\n";
-    o += kv("QuestID", num(c.questId), "重开时接的任务 ID，0 = 用上一次的任务");
-    o += kv("Reset", num(c.reset), "1 = 重置后回据点再接（慢，完全走正规流程）");
-    o += kv("AcceptOnly", num(c.acceptOnly), "1 = 只接任务，不出发");
-    o += kv("WyvernStart", num(c.wyvern), "1 = 普通地图用翼龙起始");
-    o += kv("ActiveSet", c.activeSet, "重开时套用的全套（下面 [Set.名字]），空 = 不套");
-    o += kv("Food", num(c.food), "每次进任务都吃的猫饭（下面 [Food.编号]），0 = 不管");
-    o += kv("QuickBlackout", num(c.quickBlackout), "缩短转场黑屏");
-    o += kv("PanelOpacity", num(c.panelOpacity), "面板不透明度 30~100");
+    o += kv("QuestID", num(c.questId), i18n::Tr("重开时接的任务 ID，0 = 用上一次的任务",
+                                                "Quest to take when restarting, 0 = last one",
+                                                "再開時に受注するクエスト ID、0 = 前回のもの"));
+    o += kv("Reset", num(c.reset), i18n::Tr("1 = 重置后回据点再接（慢，完全走正规流程）",
+                                            "1 = go back to base and re-accept (slow, fully legit)",
+                                            "1 = リセット後に拠点へ戻って受注（遅いが正規の手順）"));
+    o += kv("AcceptOnly", num(c.acceptOnly), i18n::Tr("1 = 只接任务，不出发",
+                                                      "1 = accept the quest but do not depart",
+                                                      "1 = 受注のみ、出発しない"));
+    o += kv("WyvernStart", num(c.wyvern), i18n::Tr("1 = 普通地图用翼龙起始",
+                                                   "1 = start normal maps with the wingdrake",
+                                                   "1 = 通常マップは翼竜で開始"));
+    o += kv("ActiveSet", c.activeSet, i18n::Tr("重开时套用的全套（下面 [Set.名字]），空 = 不套",
+                                               "Set to apply on restart (a [Set.name] below), empty = none",
+                                               "再開時に適用するセット（下の [Set.名前]）、空 = 適用しない"));
+    o += kv("Food", num(c.food), i18n::Tr("每次进任务都吃的猫饭（下面 [Food.编号]），0 = 不管",
+                                          "Meal eaten on every quest start (a [Food.n] below), 0 = leave it",
+                                          "クエスト開始ごとに食べる猫飯（下の [Food.番号]）、0 = 変更しない"));
+    o += kv("QuickBlackout", num(c.quickBlackout), i18n::Tr("缩短转场黑屏",
+                                                           "Shorten the transition fade",
+                                                           "遷移時の暗転を短縮"));
+    o += kv("PanelOpacity", num(c.panelOpacity), i18n::Tr("面板不透明度 30~100",
+                                                          "Panel opacity, 30~100",
+                                                          "パネルの不透明度 30~100"));
+    o += kv("Hdr", c.hdr, i18n::Tr("HDR 面板颜色：auto = 按交换链色域判断，off / scrgb / hdr10 可强制",
+                                   "HDR panel colors: auto detects from the swap chain; off / scrgb / hdr10 force",
+                                   "HDR パネル色：auto はスワップチェーンから判定、off / scrgb / hdr10 で強制"));
+    o += kv("SdrNits", num(c.sdrNits), i18n::Tr("SDR 白点亮度（Windows 显示设置里的 SDR 内容亮度），默认 203",
+                                                 "SDR white level in nits (Windows SDR content brightness), default 203",
+                                                 "SDR 白の輝度（Windows の SDR コンテンツの明るさ）、既定 203"));
+    o += kv("Language", c.language, i18n::Tr("界面语言 zh / en / ja，auto = 跟系统界面语言",
+                                            "UI language: zh / en / ja, auto = follow the system UI language",
+                                            "表示言語 zh / en / ja、auto = OS の表示言語に従う"));
     if (c.debug) o += kv("Debug", num(c.debug), "");
+    o += "\r\n[Debug]\r\n";
+    o += i18n::Tr("; 排查用：关掉指定的过滤器（pad / cursor / kbd / din / overlay，逗号分隔；all = 前四个）。\r\n"
+                  "; 平时留空。关掉后对应那类输入会漏进游戏，但别的功能照常。\r\n",
+                  "; Diagnostics: turn off individual filters (pad / cursor / kbd / din / overlay, comma separated;"
+                  " all = the first four).\r\n; Leave empty normally. Input of that kind leaks through while off.\r\n",
+                  "; 切り分け用：指定したフィルタを切る（pad / cursor / kbd / din / overlay、カンマ区切り；all = 前四つ）。\r\n"
+                  "; 普段は空のまま。切った種類の入力はゲームに漏れます。\r\n");
+    o += kv("Disable", c.debugDisable, "");
+
     o += "\r\n[Hotkeys]\r\n";
-    o += "; 手柄：A B X Y LB RB LT RT LS RS Up Down Left Right View Menu\r\n";
-    o += "; 键盘：Ctrl Shift Alt F1~F12 A~Z 0~9 Insert Delete Home End PageUp PageDown\r\n";
-    o += "; 多个组合用 | 隔开\r\n";
-    o += kv("Restart", c.hkRestart, "重开");
-    o += kv("Panel", c.hkPanel, "打开/关闭面板");
-    o += "\r\n; 全套：Equip/Item 写游戏里的套装名字，或游戏列表里看到的编号\r\n";
+    o += i18n::Tr("; 手柄：A B X Y LB RB LT RT LS RS Up Down Left Right View Menu\r\n",
+                  "; Gamepad: A B X Y LB RB LT RT LS RS Up Down Left Right View Menu\r\n",
+                  "; ゲームパッド：A B X Y LB RB LT RT LS RS Up Down Left Right View Menu\r\n");
+    o += i18n::Tr("; 键盘：Ctrl Shift Alt F1~F12 A~Z 0~9 Insert Delete Home End PageUp PageDown\r\n",
+                  "; Keyboard: Ctrl Shift Alt F1~F12 A~Z 0~9 Insert Delete Home End PageUp PageDown\r\n",
+                  "; キーボード：Ctrl Shift Alt F1~F12 A~Z 0~9 Insert Delete Home End PageUp PageDown\r\n");
+    o += i18n::Tr("; 多个组合用 | 隔开\r\n",
+                  "; separate combinations with |\r\n",
+                  "; 複数の組み合わせは | で区切る\r\n");
+    o += kv("Restart", c.hkRestart, i18n::Tr("重开", "Restart", "再開"));
+    o += kv("Panel", c.hkPanel, i18n::Tr("打开/关闭面板", "Open/close the panel", "パネルの開閉"));
+    o += kv("ResetOnly", c.hkResetOnly, i18n::Tr("只重置任务（不接任务、不出发），留空 = 用面板上的按钮",
+                                                  "Reset the quest only (no accept, no depart); empty = use the panel button",
+                                                  "クエストのリセットのみ（受注・出発なし）。空 = パネルのボタンを使う"));
+    o += i18n::Tr("\r\n; 全套：Equip/Item 写游戏里的套装名字，或游戏列表里看到的编号\r\n",
+                  "\r\n; Loadout: Equip/Item takes the in-game loadout name, or the number shown in the game\r\n",
+                  "\r\n; セット：Equip/Item にはゲーム内のセット名か、ゲームの一覧に出る番号を書く\r\n");
     if (c.sets.empty())
-        o += ";[Set.示例]\r\n;Equip=1\r\n;Item=1\r\n;LinkRadial=0\r\n;Food=1\r\n;Quest=66845\r\n";
+        o += i18n::Tr(";[Set.示例]\r\n;Equip=1\r\n;Item=1\r\n;LinkRadial=0\r\n;Food=1\r\n;Quest=66845\r\n",
+                      ";[Set.example]\r\n;Equip=1\r\n;Item=1\r\n;LinkRadial=0\r\n;Food=1\r\n;Quest=66845\r\n",
+                      ";[Set.例]\r\n;Equip=1\r\n;Item=1\r\n;LinkRadial=0\r\n;Food=1\r\n;Quest=66845\r\n");
     for (const auto& s : c.sets) {
         o += "[Set." + s.name + "]\r\n";
         o += kv("Equip", s.equip, "");
         o += kv("Item", s.item, "");
-        o += kv("LinkRadial", num(s.linkRadial), "套道具时联动快捷栏");
+        o += kv("LinkRadial", num(s.linkRadial), i18n::Tr("套道具时联动快捷栏",
+                                                          "Link the shortcut bar when swapping items",
+                                                          "アイテム切替時にショートカットを連動"));
         o += kv("Food", num(s.food), "");
         o += kv("Quest", num(s.quest), "");
         o += "\r\n";
     }
-    o += "; 猫饭：HP 0~5（+0~+50） Stamina 0~2（+0/+25/+50） Attack/Defense/ElemRes 0~3（无/小/中/大）"
-         " Skills 三个技能编号，-1 = 无\r\n";
+    o += i18n::Tr("; 猫饭：HP 0~5（+0~+50） Stamina 0~2（+0/+25/+50） Attack/Defense/ElemRes 0~3（无/小/中/大）"
+                  " Skills 三个技能编号，-1 = 无\r\n",
+                  "; Meal: HP 0~5 (+0~+50), Stamina 0~2 (+0/+25/+50), Attack/Defense/ElemRes 0~3 (none/small/medium/large)"
+                  " Skills takes three skill numbers, -1 = none\r\n",
+                  "; 猫飯：HP 0~5（+0~+50） Stamina 0~2（+0/+25/+50） Attack/Defense/ElemRes 0~3（なし/小/中/大）"
+                  " Skills はスキル番号 3 つ、-1 = なし\r\n");
     if (c.foods.empty())
         o += ";[Food.1]\r\n;HP=5\r\n;Stamina=2\r\n;Attack=3\r\n;Defense=0\r\n;ElemRes=0\r\n;Skills=9,32,39\r\n";
     for (const auto& kvp : c.foods) {
@@ -136,7 +195,9 @@ bool LoadConfig(const std::wstring& path, Config& cfg, std::string& err)
     std::string txt;
     if (!ReadAll(path, txt)) {
         SaveDefaultConfig(path);
-        if (!ReadAll(path, txt)) { err = "读不到也建不了配置文件"; return false; }
+        if (!ReadAll(path, txt)) { err = i18n::Tr("读不到也建不了配置文件",
+                                                  "cannot read or create the config file",
+                                                  "設定ファイルを読めず、作成もできません"); return false; }
     }
     cfg = Config();
     std::string sec;
@@ -176,10 +237,16 @@ bool LoadConfig(const std::wstring& path, Config& cfg, std::string& err)
             else if (k == "Food") cfg.food = n;
             else if (k == "QuickBlackout") cfg.quickBlackout = Bool(v);
             else if (k == "PanelOpacity") cfg.panelOpacity = n < 30 ? 30 : (n > 100 ? 100 : n);
+            else if (k == "Language") cfg.language = v;
+            else if (k == "Hdr") cfg.hdr = v;
+            else if (k == "SdrNits") cfg.sdrNits = n < 80 ? 80 : (n > 10000 ? 10000 : n);
             else if (k == "Debug") cfg.debug = n;
+        } else if (sec == "Debug") {
+            if (k == "Disable") cfg.debugDisable = v;
         } else if (sec == "Hotkeys") {
             if (k == "Restart") cfg.hkRestart = v;
             else if (k == "Panel") cfg.hkPanel = v;
+            else if (k == "ResetOnly") cfg.hkResetOnly = v;
         } else if (curSet) {
             if (k == "Equip") curSet->equip = v;
             else if (k == "Item") curSet->item = v;

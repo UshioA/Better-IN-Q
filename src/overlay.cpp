@@ -3,6 +3,8 @@
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include "overlay.h"
 
+#include "hdr.h"
+#include "i18n.h"
 #include "log.h"
 
 #include <windows.h>
@@ -10,6 +12,7 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <atomic>
+#include <cstdio>
 #include <vector>
 
 #include <cfloat>
@@ -320,6 +323,7 @@ int InitRenderer(IDXGISwapChain* sc)
         return 0;
     }
     if (g_cb.init) g_cb.init(h > 0 ? h / 1080.0f : 1.0f);
+    hdr::Detect(sc);   // 按交换链的色域决定要不要做 HDR 转换
     g_wndProc = reinterpret_cast<WNDPROC>(::SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WndProc)));
     g_inited = true;
     Log("overlay: 就绪（%s，窗口 %ldx%ld，缓冲 %ux%u x%u，格式 %d）", g_api == kD3D11 ? "D3D11" : "D3D12",
@@ -386,6 +390,7 @@ void RenderPanel(IDXGISwapChain* sc)
     ImGui::NewFrame();
     if (g_cb.draw) g_cb.draw(io.DisplaySize.x, io.DisplaySize.y);
     ImGui::Render();
+    hdr::Apply(ImGui::GetDrawData());   // HDR 交换链：把顶点颜色换成目标编码
     if (g_api == kD3D12) {
         Render12(sc, ImGui::GetDrawData());
         return;
@@ -402,8 +407,50 @@ void RenderPanel(IDXGISwapChain* sc)
     }
 }
 
+// ---- 诊断：面板关着时，我们这一帧花了多少时间、游戏帧间隔多少（每 30 秒写一行日志）
+std::atomic<unsigned long long> g_pCalls{0}, g_pTicks{0}, g_pMax{0};
+unsigned long long g_pLastQpc = 0, g_fTicks = 0, g_fN = 0;
+unsigned long long g_perfAt = 0;
+
+double QpcUs0(unsigned long long ticks)
+{
+    static double perTick = 0;
+    if (perTick == 0) {
+        LARGE_INTEGER f;
+        ::QueryPerformanceFrequency(&f);
+        perTick = 1e6 / (double)f.QuadPart;
+    }
+    return (double)ticks * perTick;
+}
+
+void PerfTick(unsigned long long begin, unsigned long long end)
+{
+    const unsigned long long d = end - begin;
+    ++g_pCalls;
+    g_pTicks += d;
+    if (d > g_pMax) g_pMax = d;
+    if (g_pLastQpc) { g_fTicks += begin - g_pLastQpc; ++g_fN; }
+    g_pLastQpc = begin;
+    const unsigned long long now = ::GetTickCount64();
+    if (!g_perfAt) { g_perfAt = now; return; }
+    if (now - g_perfAt < 30000) return;
+    const unsigned long long calls = g_pCalls.exchange(0);
+    const unsigned long long ticks = g_pTicks.exchange(0);
+    const unsigned long long mx = g_pMax.exchange(0);
+    const unsigned long long fN = g_fN;
+    const unsigned long long fT = g_fTicks;
+    g_fN = 0;
+    g_fTicks = 0;
+    g_perfAt = now;
+    if (!calls) return;
+    Log("perf: Present 钩子 %llu 次，平均 %.2f µs、最大 %.2f µs；帧间隔 平均 %.1f ms", calls,
+        QpcUs0(ticks) / (double)calls, QpcUs0(mx), fN ? QpcUs0(fT) / (double)fN / 1000.0 : 0.0);
+}
+
 HRESULT WINAPI HkPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
+    LARGE_INTEGER q0, q1;
+    ::QueryPerformanceCounter(&q0);
     if (!g_failed.load() && !(flags & DXGI_PRESENT_TEST)) {
         // 第一次打开面板才初始化（要读字体文件），从没打开过就完全不碰游戏的渲染
         if (!g_inited && g_open.load()) {
@@ -417,6 +464,8 @@ HRESULT WINAPI HkPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
             }
         }
         if (g_inited && IsGameSwapChain(sc)) RenderPanel(sc);
+        ::QueryPerformanceCounter(&q1);
+        if (!g_open.load()) PerfTick((unsigned long long)q0.QuadPart, (unsigned long long)q1.QuadPart);
     }
     return g_present(sc, sync, flags);
 }
@@ -432,14 +481,18 @@ void BeforeResize(IDXGISwapChain* sc)
 HRESULT WINAPI HkResize(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
 {
     BeforeResize(sc);
-    return g_resize(sc, n, w, h, f, flags);
+    const HRESULT r = g_resize(sc, n, w, h, f, flags);
+    if (sc == g_sc) hdr::Detect(sc);
+    return r;
 }
 
 HRESULT WINAPI HkResize1(IDXGISwapChain3* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags, const UINT* mask,
                          IUnknown* const* queues)
 {
     BeforeResize(sc);
-    return g_resize1(sc, n, w, h, f, flags, mask, queues);
+    const HRESULT r = g_resize1(sc, n, w, h, f, flags, mask, queues);
+    if (sc == g_sc) hdr::Detect(sc);
+    return r;
 }
 
 // 建一个临时窗口和交换链，只为拿到交换链的虚表（D3D11 和 D3D12 的交换链是同一个类，共用这张表）
@@ -480,7 +533,11 @@ void** GetSwapChainVtable(std::string& err, void*** vt3)
             sc3->Release();
         }
     } else {
-        err = "建临时交换链失败 hr=" + std::to_string((long)hr);
+        char code[16];
+        std::snprintf(code, sizeof(code), "0x%X", static_cast<unsigned>(hr));
+        err = i18n::Fmt(i18n::Tr("建临时交换链失败 hr=%s",
+                                "creating a temporary swap chain failed, hr=%s",
+                                "一時スワップチェーンの作成に失敗 hr=%s"), code);
     }
     if (sc) sc->Release();
     if (ctx) ctx->Release();
@@ -501,7 +558,7 @@ bool Install(const Callbacks& cb, std::string& err)
     // IDXGISwapChain 虚表：8 = Present，13 = ResizeBuffers；IDXGISwapChain3：39 = ResizeBuffers1（DX12 游戏可能用它）
     if (!PatchSlot(&vt[8], reinterpret_cast<void*>(HkPresent), reinterpret_cast<void**>(&g_present)) ||
         !PatchSlot(&vt[13], reinterpret_cast<void*>(HkResize), reinterpret_cast<void**>(&g_resize))) {
-        err = "改交换链虚表失败";
+        err = i18n::Tr("改交换链虚表失败", "patching the swap chain vtable failed", "スワップチェーンの仮想関数テーブルの書き換えに失敗");
         return false;
     }
     if (vt3 && !PatchSlot(&vt3[39], reinterpret_cast<void*>(HkResize1), reinterpret_cast<void**>(&g_resize1)))

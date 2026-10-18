@@ -1,11 +1,14 @@
 #include "cursorfilter.h"
 
 #include "hook.h"
+#include "i18n.h"
 #include "log.h"
 
 #include <windows.h>
 #include <cstdint>
+#include <atomic>
 #include <mutex>
+#include <cstdio>
 
 namespace cursorfilter {
 namespace {
@@ -29,23 +32,61 @@ bool g_clipOn = false;   // 游戏要的锁定范围（g_clipOn=false 表示不�
 RECT g_clip = {};
 bool g_clipDirty = false;   // 面板开着期间锁定范围被动过 → 关面板时要按游戏的意思重设
 bool g_installed = false;
+std::atomic<long> g_reads{0};   // 面板开着时游戏读了几次光标位置（诊断）
+
+// 诊断：游戏每帧调了这些钩子几次、每次花多久（日志 perf 行）
+std::atomic<long long> g_calls{0}, g_us{0}, g_maxUs{0};
+
+long long NowUs()
+{
+    static const long long freq = [] { LARGE_INTEGER f; ::QueryPerformanceFrequency(&f); return f.QuadPart; }();
+    LARGE_INTEGER t;
+    ::QueryPerformanceCounter(&t);
+    return t.QuadPart * 1000000LL / freq;
+}
+
+void Rec(long long t0)
+{
+    g_calls.fetch_add(1, std::memory_order_relaxed);
+    const long long d = NowUs() - t0;
+    g_us.fetch_add(d, std::memory_order_relaxed);
+    long long m = g_maxUs.load(std::memory_order_relaxed);
+    while (d > m && !g_maxUs.compare_exchange_weak(m, d, std::memory_order_relaxed)) {}
+}
 
 // 钩子都在锁里调原函数：SetBlock 改状态和游戏改光标不会交错（两者都不会回调进来）
 BOOL WINAPI HkSetCursorPos(int x, int y)
 {
-    std::lock_guard<std::mutex> lk(g_mx);
-    if (!g_block) return g_orig.setPos(x, y);
-    g_pos = {x, y};
-    g_moved = true;
-    return TRUE;
+    const long long t0 = NowUs();
+    BOOL r;
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        if (!g_block) r = g_orig.setPos(x, y);
+        else {
+            g_pos = {x, y};
+            g_moved = true;
+            r = TRUE;
+        }
+    }
+    Rec(t0);
+    return r;
 }
 
 BOOL WINAPI HkGetCursorPos(LPPOINT p)
 {
-    std::lock_guard<std::mutex> lk(g_mx);
-    if (!g_block || !p) return g_orig.getPos(p);
-    *p = g_pos;
-    return TRUE;
+    const long long t0 = NowUs();
+    BOOL r;
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        if (!g_block || !p) r = g_orig.getPos(p);
+        else {
+            ++g_reads;
+            *p = g_pos;
+            r = TRUE;
+        }
+    }
+    Rec(t0);
+    return r;
 }
 
 BOOL WINAPI HkClipCursor(const RECT* r)
@@ -82,12 +123,15 @@ bool Install(std::string& info)
 {
     if (g_installed) return true;
     HMODULE u = ::GetModuleHandleW(L"user32.dll");
-    if (!u) { info = "user32 还没加载"; return false; }
+    if (!u) { info = i18n::Tr("user32 还没加载", "user32 is not loaded yet", "user32 がまだ読み込まれていません"); return false; }
     // 先填好原函数再换指针：换完的下一瞬间游戏就可能调进来
     g_orig.setPos = reinterpret_cast<SetPosFn>(::GetProcAddress(u, "SetCursorPos"));
     g_orig.getPos = reinterpret_cast<GetPosFn>(::GetProcAddress(u, "GetCursorPos"));
     g_orig.clip = reinterpret_cast<ClipFn>(::GetProcAddress(u, "ClipCursor"));
-    if (!g_orig.setPos || !g_orig.getPos || !g_orig.clip) { info = "user32 里找不到光标函数"; return false; }
+    if (!g_orig.setPos || !g_orig.getPos || !g_orig.clip) {
+        info = i18n::Tr("user32 里找不到光标函数", "no cursor functions found in user32", "user32 にカーソル関数が見つかりません");
+        return false;
+    }
 
     const std::uintptr_t exe = reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
     const struct { const char* name; void* fn; void* hk; } fns[] = {
@@ -102,12 +146,14 @@ bool Install(std::string& info)
         const int n = hook::ReplaceModulePointers(exe, fns[i].fn, fns[i].hk, &g_orig, &g_orig + 1, &where);
         if (n) Log("cursorfilter: 换掉 %s处的 %s", where.c_str(), fns[i].name);
         hits[i] += n;
-        info += std::string(i ? "，" : "") + fns[i].name + " " + std::to_string(hits[i]) + " 处";
+        info += std::string(i ? i18n::Tr("，", ", ", "、") : "") + fns[i].name + " x" + std::to_string(hits[i]);
     }
     if (!hits[0]) return false;
     // 只换到 SetCursorPos：面板开着时游戏读到的是真实位置，会以为鼠标在动。
     // 光标照样不会被拽回中间，只是视角可能跟着转，记一笔方便查。
-    if (!hits[1]) info += "（没换到 GetCursorPos，面板开着时视角可能跟着鼠标转）";
+    if (!hits[1]) info += i18n::Tr("（没换到 GetCursorPos，面板开着时视角可能跟着鼠标转）",
+                                   " (GetCursorPos not patched: with the panel open the camera may follow the mouse)",
+                                   "（GetCursorPos を差し替えられず、パネル表示中は視点がマウスに反応する場合があります）");
     g_installed = true;
     return true;
 }
@@ -133,6 +179,19 @@ void SetBlock(bool block)
         if (g_clipDirty) g_orig.clip(g_clipOn ? &g_clip : nullptr);
     }
     g_block = block;
+}
+
+void ResetStats() { g_reads.store(0, std::memory_order_relaxed); }
+
+std::string Stats()
+{
+    const long long n = g_calls.load(std::memory_order_relaxed);
+    const long long us = g_us.load(std::memory_order_relaxed);
+    const long long mx = g_maxUs.load(std::memory_order_relaxed);
+    char b[128];
+    std::snprintf(b, sizeof(b), "GetCursorPos=%ld 调用=%lld 次 平均=%.2f us 最大=%.1f us",
+                  g_reads.load(std::memory_order_relaxed), n, n ? double(us) / double(n) : 0.0, double(mx));
+    return b;
 }
 
 } // namespace cursorfilter

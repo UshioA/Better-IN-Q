@@ -10,6 +10,7 @@
 
 #include "game.h"
 #include "hook.h"
+#include "i18n.h"
 #include "log.h"
 
 #include <windows.h>
@@ -27,7 +28,7 @@ using hook::Ctx;
 
 bool g_ready = false;
 
-enum MsgBit : std::uint32_t { kMsgEquip = 1, kMsgQuest = 2, kMsgCant = 4, kMsgWindow = 8 };
+enum MsgBit : std::uint32_t { kMsgEquip = 1, kMsgQuest = 2, kMsgCant = 4, kMsgWindow = 8, kMsgNoQuest = 16 };
 
 // ---------------------------------------------------------------------------
 //  ApplyResetAndEquip：原指令 mov rcx,rbx ; call [rax+70]
@@ -103,13 +104,25 @@ void OnApplyResetAndEquip(Ctx* c)
         g.restart = 0;
         return;
     }
+    // 在据点 / 调查：只重置没有可重置的任务，直接收工（不然会顺着去接任务）
+    if (st == 1 || st == 0xD) {
+        if (g.optResetOnly) {
+            g.optResetOnly = 0;
+            g.restart = 0;
+            g.message |= kMsgNoQuest;
+            return;
+        }
+        g.restart = 3;
+        return;
+    }
     g.restart = 3;
-    if (st == 1 || st == 0xD) return;                                  // 在据点 / 调查 → 直接去接任务
     if (st != 2 || Rd<std::uint32_t>(q + 0x54) != 2) { CantQ(); return; }   // 不在任务里
 
-    // optioncheck
-    g.restart = 3;
-    if (!(g.optAcceptOnly == 1 || g.optReset == 1)) g.restart = 2;   // 直接重开：拦住回据点
+    // optioncheck（CT：Restart+6 = 这一次只重置，用过就清掉）
+    const bool resetOnly = g.optResetOnly != 0;
+    g.optResetOnly = 0;
+    g.restart = resetOnly ? 0 : 3;   // 只重置：触发游戏的复位之后就收工，不接任务、不出发
+    if (!resetOnly && !(g.optAcceptOnly == 1 || g.optReset == 1)) g.restart = 2;   // 直接重开：拦住回据点
 
     // ifquest：死了的话先补满血、把动作清零，免得重置卡在倒地状态
     const std::uintptr_t pl = P(P(pPlayerA) + 0x108);
@@ -230,7 +243,7 @@ bool BytesAre(std::uintptr_t a, const char* hex)
 
 std::string Hex(std::uintptr_t a, std::size_t n)
 {
-    if (!Readable(a, n)) return "(读不到)";
+    if (!Readable(a, n)) return i18n::Tr("(读不到)", "(unreadable)", "(読めません)");
     std::string s;
     char b[4];
     for (std::size_t i = 0; i < n; ++i) {
@@ -498,8 +511,12 @@ void QueueSet(const LoadoutSet& s)
 {
     const int e = ResolveEquip(s.equip);
     const int it = ResolveItem(s.item);
-    if (!s.equip.empty() && !e) Chat("Better-IN-Q：装备套装「" + s.equip + "」找不到");
-    if (!s.item.empty() && !it) Chat("Better-IN-Q：道具套装「" + s.item + "」找不到");
+    if (!s.equip.empty() && !e) Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：装备套装「%s」找不到",
+                                                       "Better-IN-Q: loadout \"%s\" not found",
+                                                       "Better-IN-Q：装備セット「%s」が見つかりません"), s.equip.c_str()));
+    if (!s.item.empty() && !it) Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：道具套装「%s」找不到",
+                                                       "Better-IN-Q: item loadout \"%s\" not found",
+                                                       "Better-IN-Q：アイテムセット「%s」が見つかりません"), s.item.c_str()));
     if (e) g.equipLoadout = e;
     if (it) { g_pendingSetItem = it; g_pendingLink = s.linkRadial; g_hasPendingLink = true; }
     if (s.food) g.food = s.food;
@@ -508,12 +525,34 @@ void QueueSet(const LoadoutSet& s)
 
 void RequestRestart(const Config& cfg)
 {
-    if (!g_ready) { Chat("Better-IN-Q：重开功能没装上，详情见 BetterINQ.log"); return; }
+    if (!g_ready) {
+        Chat(i18n::Tr("Better-IN-Q：重开功能没装上，详情见 BetterINQ.log",
+                      "Better-IN-Q: the restart hook did not install, see BetterINQ.log",
+                      "Better-IN-Q：再開機能を組み込めませんでした。BetterINQ.log を見てください"));
+        return;
+    }
     if (g.restart != 0) return;
     if (!cfg.activeSet.empty()) {
         if (const LoadoutSet* s = cfg.FindSet(cfg.activeSet)) QueueSet(*s);
-        else Chat("Better-IN-Q：配置里没有叫「" + cfg.activeSet + "」的全套");
+        else Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：配置里没有叫「%s」的全套",
+                                     "Better-IN-Q: no loadout set named \"%s\" in the config",
+                                     "Better-IN-Q：設定に「%s」というセットがありません"), cfg.activeSet.c_str()));
     }
+    g.restart = 1;
+}
+
+// 只重置（原 IN-Q 的 Reset only，CT 里是 [Restart+6]）：把当前任务重置掉、回据点，
+// 不接任务也不出发。不套用全套配置 —— 这一趟只是把任务清掉。
+void RequestResetOnly()
+{
+    if (!g_ready) {
+        Chat(i18n::Tr("Better-IN-Q：重开功能没装上，详情见 BetterINQ.log",
+                      "Better-IN-Q: the restart hook did not install, see BetterINQ.log",
+                      "Better-IN-Q：再開機能を組み込めませんでした。BetterINQ.log を見てください"));
+        return;
+    }
+    if (g.restart != 0) return;
+    g.optResetOnly = 1;
     g.restart = 1;
 }
 
@@ -527,7 +566,7 @@ std::vector<NamedLoadout> ListEquipLoadouts()
         if (!Readable(w - 0x100, 0x104) || Rd<std::uint32_t>(w) == 0xFFFFFFFF) continue;   // 空格子
         char name[0x101] = {};
         std::memcpy(name, reinterpret_cast<const void*>(w - 0x100), 0x100);
-        r.push_back({n, name[0] ? std::string(name) : "装备套装 " + std::to_string(n)});
+        r.push_back({n, name[0] ? std::string(name) : std::string(i18n::Tr("装备套装 ", "Equip loadout ", "装備セット ")) + std::to_string(n)});
     }
     return r;
 }
@@ -545,7 +584,7 @@ std::vector<NamedLoadout> ListItemLoadouts()
         const std::uintptr_t a = ItemNameAt(slot, st);
         char name[0x101] = {};
         if (Readable(a, 0x100)) std::memcpy(name, reinterpret_cast<const void*>(a), 0x100);
-        r.push_back({d, name[0] ? std::string(name) : "道具套装 " + std::to_string(d)});
+        r.push_back({d, name[0] ? std::string(name) : std::string(i18n::Tr("道具套装 ", "Item loadout ", "アイテムセット ")) + std::to_string(d)});
     }
     return r;
 }
@@ -597,7 +636,9 @@ void Tick(const Config& cfg)
             Wr<std::uint64_t>(uib + 0x8F60, 1);
             Log("item loadout %d 已提交（联动快捷栏 %d）", n, g_savedRadial == -1 ? -1 : (g_pendingLink ? 1 : 2));
         } else {
-            Chat("Better-IN-Q：道具套装 " + std::to_string(n) + " 是空的");
+            Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：道具套装 %d 是空的",
+                                    "Better-IN-Q: item loadout %d is empty",
+                                    "Better-IN-Q：アイテムセット %d は空です"), n));
         }
     }
 
@@ -617,10 +658,21 @@ void Tick(const Config& cfg)
     const std::uint32_t m = g.message;
     if (m) {
         g.message = 0;
-        if (m & kMsgEquip) Chat("Better-IN-Q：这个装备套装是空的或无效");
-        if (m & kMsgQuest) Chat("Better-IN-Q：接任务失败（没选过任务？）");
-        if (m & kMsgCant) Chat("Better-IN-Q：现在不能重开");
-        if (m & kMsgWindow) Chat("Better-IN-Q：请先关闭所有窗口");
+        if (m & kMsgEquip) Chat(i18n::Tr("Better-IN-Q：这个装备套装是空的或无效",
+                                         "Better-IN-Q: that loadout is empty or invalid",
+                                         "Better-IN-Q：その装備セットは空か無効です"));
+        if (m & kMsgQuest) Chat(i18n::Tr("Better-IN-Q：接任务失败（没选过任务？）",
+                                         "Better-IN-Q: could not accept the quest (no quest picked yet?)",
+                                         "Better-IN-Q：クエストを受けられませんでした（まだ選んでいませんか？）"));
+        if (m & kMsgCant) Chat(i18n::Tr("Better-IN-Q：现在不能重开",
+                                        "Better-IN-Q: cannot restart right now",
+                                        "Better-IN-Q：今は再開できません"));
+        if (m & kMsgWindow) Chat(i18n::Tr("Better-IN-Q：请先关闭所有窗口",
+                                          "Better-IN-Q: close all windows first",
+                                          "Better-IN-Q：先にすべてのウィンドウを閉じてください"));
+        if (m & kMsgNoQuest) Chat(i18n::Tr("Better-IN-Q：现在不在任务里，没有可重置的",
+                                           "Better-IN-Q: not in a quest, nothing to reset",
+                                           "Better-IN-Q：クエスト中ではないのでリセットできません"));
     }
 }
 

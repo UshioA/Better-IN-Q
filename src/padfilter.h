@@ -21,8 +21,14 @@ bool Install(std::string& info);
 bool Installed();
 
 void SetBlock(bool block);            // 面板开着 → 挡住全部输入
-void SetChord(unsigned short mask);   // 面板组合键里的手柄按钮（XINPUT_GAMEPAD_* 位），0 = 不扣
 
+// 诊断用：游戏自己调了几次 XInputGetState（日志 perf 行）
+std::string Profile();   // 面板组合键里的手柄按钮（XINPUT_GAMEPAD_* 位），0 = 不扣
+
+// 游戏自己每帧读手柄时把原始状态记下来：快捷键那边直接用它，就不用再单独轮询 XInput。
+// 轮询会和游戏的调用抢 XInput 内部的锁，蓝牙手柄上一次调用可能几毫秒，卡顿会摊到所有输入上。
+// 返回 false = 这个位置最近一秒没被游戏读过。
+bool Latest(unsigned long pad, unsigned short* buttons, unsigned char* lt, unsigned char* rt);
 // 测试用：直接对一份手柄状态跑一遍过滤（不经过 XInput）
 void TestFilter(unsigned long pad, void* xinputState);
 

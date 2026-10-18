@@ -1,4 +1,4 @@
-// 面板的手柄导航：模拟十字键 / A / B，看页面和焦点是不是按设计走。离屏渲染，不开窗口。
+﻿// 面板的手柄导航：模拟十字键 / A / B，看页面和焦点是不是按设计走。离屏渲染，不开窗口。
 #include <windows.h>
 #include <d3d11.h>
 #include <cstdio>
@@ -121,6 +121,16 @@ int main()
 
     Press(ImGuiKey_GamepadFaceRight);
     CHECK(m.reqClose, "主页按 B：请求关面板");
+    m.reqClose = false;
+
+    // 只重置任务：在「重开」下面那排圆按钮之后，按 A 只提「只重置」，不会顺手接任务
+    ui::OnOpen(m);
+    for (int i = 0; i < 4; ++i) Frame();
+    Press(ImGuiKey_GamepadDpadDown);    // 重开 → 中间「换套装」
+    Press(ImGuiKey_GamepadDpadDown);    // → 「只重置任务」
+    Press(ImGuiKey_GamepadFaceDown);
+    CHECK(m.reqResetOnly && m.reqClose && !m.reqRestart, "主页：往下两次、A → 只重置任务（不重开）");
+    m.reqResetOnly = false;
     m.reqClose = false;
 
     // 侧栏里按 A：切页并把焦点送进内容区

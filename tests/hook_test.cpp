@@ -30,6 +30,9 @@ int  t4_with_rsi(std::uint64_t rsi);
 extern unsigned char t4_func[];
 }
 
+// 下面这四段桩函数用 GNU 的 asm(...) 写（GCC / MinGW / clang）。
+// MSVC 不认这种写法，同样的指令字节放在 tests/hook_test_asm.asm 里，由 ml64 汇编。
+#if defined(__GNUC__) || defined(__clang__)
 asm(R"(
     .intel_syntax noprefix
     .text
@@ -96,6 +99,7 @@ t4_func:
     ret
     .att_syntax prefix
 )");
+#endif
 
 // ---- 测试 1 的道具 ----
 struct Obj { unsigned char pad[0x58]; int v; };

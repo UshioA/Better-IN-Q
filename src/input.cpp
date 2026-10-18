@@ -1,5 +1,8 @@
 #include "input.h"
 
+#include "i18n.h"
+#include "padfilter.h"
+
 #include <windows.h>
 #include <xinput.h>
 #include <algorithm>
@@ -10,6 +13,8 @@ namespace {
 
 typedef DWORD(WINAPI* XInputGetStateFn)(DWORD, XINPUT_STATE*);
 XInputGetStateFn g_getState = nullptr;
+int g_ourCalls = 0;                        // 诊断：我们自己的 XInput 调用次数
+ULONGLONG g_probeAt[XUSER_MAX_COUNT] = {};  // 这个位置下次允许探测的时间
 
 std::string Upper(std::string s)
 {
@@ -131,15 +136,33 @@ void Input::Poll()
     buttons_ = 0;
     lt_ = rt_ = 0;
     if (!focused_ || !g_getState) return;
+    const ULONGLONG now = ::GetTickCount64();
     for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
-        XINPUT_STATE s{};
-        if (g_getState(i, &s) != ERROR_SUCCESS) continue;
+        unsigned short btn = 0;
+        unsigned char l = 0, r = 0;
+        // 游戏自己每帧读手柄（经过 padfilter），状态直接从那儿拿：这一路不用再问 XInput。
+        // 只有游戏没在读（比如它换用别的库、或这个位置没手柄）才自己补一次，而且会退避。
+        if (!padfilter::Latest(i, &btn, &l, &r)) {
+            if (now < g_probeAt[i]) continue;
+            g_probeAt[i] = now + 50;   // 自己补探也最多 20 Hz，别把 XInput 当忙轮询用
+            XINPUT_STATE s{};
+            ++g_ourCalls;
+            if (g_getState(i, &s) != ERROR_SUCCESS) {
+                g_probeAt[i] = now + (i == 0 ? 1000 : 3000);   // 没手柄：隔一会儿再看
+                continue;
+            }
+            btn = s.Gamepad.wButtons;
+            l = s.Gamepad.bLeftTrigger;
+            r = s.Gamepad.bRightTrigger;
+        }
         padOk_ = true;
-        buttons_ |= s.Gamepad.wButtons;
-        if (s.Gamepad.bLeftTrigger > lt_) lt_ = s.Gamepad.bLeftTrigger;
-        if (s.Gamepad.bRightTrigger > rt_) rt_ = s.Gamepad.bRightTrigger;
+        buttons_ |= btn;
+        if (l > lt_) lt_ = l;
+        if (r > rt_) rt_ = r;
     }
 }
+
+int PollCalls() { return g_ourCalls; }
 
 bool Input::Held(const Combo& c) const
 {
@@ -243,7 +266,12 @@ std::string PadComboSpec(unsigned mask, std::string& why)
 {
     int n = 0;
     for (unsigned m = mask; m; m &= m - 1) ++n;
-    if (n < 2) { why = "手柄至少要两个键一起按（单键会和游戏操作冲突）"; return std::string(); }
+    if (n < 2) {
+        why = i18n::Tr("手柄至少要两个键一起按（单键会和游戏操作冲突）",
+                       "a gamepad hotkey needs at least two buttons (one alone clashes with the game)",
+                       "パッドは 2 つ以上のボタン同時押し（単独だとゲーム操作と衝突します）");
+        return std::string();
+    }
     return PadComboText(mask);
 }
 
@@ -255,7 +283,17 @@ std::string KeyComboSpec(const std::vector<int>& vks, std::string& why)
         if (IsModifier(vk)) mod = true;
         else { main = true; chr |= IsCharKey(vk); }
     }
-    if (!main) { why = "Ctrl / Shift / Alt 之外还要再按一个键"; return std::string(); }
-    if (chr && !mod) { why = "字母、数字键要配 Ctrl / Shift / Alt（单按会和游戏操作冲突）"; return std::string(); }
+    if (!main) {
+        why = i18n::Tr("Ctrl / Shift / Alt 之外还要再按一个键",
+                       "press one more key besides Ctrl / Shift / Alt",
+                       "Ctrl / Shift / Alt のほかにキーを 1 つ押してください");
+        return std::string();
+    }
+    if (chr && !mod) {
+        why = i18n::Tr("字母、数字键要配 Ctrl / Shift / Alt（单按会和游戏操作冲突）",
+                       "letter and number keys need Ctrl / Shift / Alt (alone they clash with the game)",
+                       "英数字キーは Ctrl / Shift / Alt と組み合わせてください（単独だとゲーム操作と衝突します）");
+        return std::string();
+    }
     return KeyComboText(vks);
 }

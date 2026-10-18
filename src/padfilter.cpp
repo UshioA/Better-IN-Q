@@ -1,6 +1,7 @@
 #include "padfilter.h"
 
 #include "hook.h"
+#include "i18n.h"
 #include "log.h"
 
 #include <windows.h>
@@ -20,21 +21,35 @@ constexpr int kSlots = 12;
 GetStateFn g_orig[kSlots] = {};
 int g_slots = 0;
 std::atomic<bool> g_block{false};
-std::atomic<unsigned short> g_chord{0};
+std::atomic<long long> g_calls{0};   // 游戏调了几次 XInputGetState（诊断用）
 bool g_installed = false;
 
-constexpr ULONGLONG kChordWindowMs = 100;
-constexpr int kPulsePolls = 4;
-
+// 面板关着的时候：什么都不改，游戏拿到的就是真实手柄状态（这就是「策略」的一半）。
+// 面板开着的时候：上面那段 muted 会把整个手柄状态清零（另一半）。
+// 以前还在这里做「组合键扣留」——为了不让游戏看到面板快捷键的那几个键，先把按键按住
+// 最多 100 ms 看会不会凑成组合键，没凑成就补发。这既拖慢了手感（原版也卡），
+// 又把快捷键和游戏按键绑死；现在改成：面板快捷键只从「过滤前的原始状态」里认，
+// 游戏照常收到按键，所以面板快捷键要选游戏自己不用的组合（默认 View+Menu）。
 struct Pad {
-    enum { kIdle, kPending, kChord, kPass } st = kIdle;
-    ULONGLONG t0 = 0;
-    unsigned short pend = 0;      // 扣住期间按过的组合键
-    int pulse = 0;                // 还要补发几次点按
-    unsigned short pulseMask = 0;
     bool muted = false;           // 面板开过：等全部松开才恢复
 };
 Pad g_pad[XUSER_MAX_COUNT];
+
+// 给快捷键用的「游戏刚读到的原始状态」（过滤前：组合键扣住的键也照记，快捷键要认它们）
+struct Published {
+    std::atomic<unsigned int> buttons{0};
+    std::atomic<unsigned int> triggers{0};   // 低 8 位 LT，高 8 位 RT
+    std::atomic<unsigned long long> at{0};
+} g_pub[XUSER_MAX_COUNT];
+
+void Publish(DWORD i, const XINPUT_STATE& s)
+{
+    if (i >= XUSER_MAX_COUNT) return;
+    g_pub[i].buttons.store(s.Gamepad.wButtons);
+    g_pub[i].triggers.store((unsigned)s.Gamepad.bLeftTrigger | ((unsigned)s.Gamepad.bRightTrigger << 8));
+    g_pub[i].at.store(::GetTickCount64());
+}
+
 
 bool AnyDown(const XINPUT_GAMEPAD& g)
 {
@@ -52,41 +67,21 @@ void Filter(DWORD i, XINPUT_STATE* s)
     if (p.muted) {
         if (!g_block.load() && !AnyDown(g)) {
             p.muted = false;
-            p.st = Pad::kIdle;
         } else {
             std::memset(&g, 0, sizeof(g));
             return;
         }
     }
-
-    const unsigned short c = g_chord.load();
-    if (!c) return;
-    const unsigned short down = g.wButtons & c;
-    const ULONGLONG now = ::GetTickCount64();
-    switch (p.st) {
-    case Pad::kIdle:
-        if (down == c) p.st = Pad::kChord;
-        else if (down) { p.st = Pad::kPending; p.t0 = now; p.pend = down; }
-        break;
-    case Pad::kPending:
-        p.pend |= down;
-        if (down == c) p.st = Pad::kChord;
-        else if (!down) { p.pulse = kPulsePolls; p.pulseMask = p.pend; p.st = Pad::kIdle; }   // 点一下就松：补发
-        else if (now - p.t0 > kChordWindowMs) p.st = Pad::kPass;
-        break;
-    case Pad::kChord:
-    case Pad::kPass:
-        if (!down) p.st = Pad::kIdle;
-        break;
-    }
-    if (p.st == Pad::kPending || p.st == Pad::kChord) g.wButtons &= ~c;
-    if (p.pulse > 0) { g.wButtons |= p.pulseMask; --p.pulse; }
 }
 
 template <int K> DWORD WINAPI HkGetState(DWORD i, XINPUT_STATE* s)
 {
+    ++g_calls;
     const DWORD r = g_orig[K](i, s);
-    if (r == ERROR_SUCCESS) Filter(i, s);
+    if (r == ERROR_SUCCESS) {
+        Publish(i, *s);
+        Filter(i, s);
+    }
     return r;
 }
 
@@ -131,16 +126,37 @@ bool Install(std::string& info)
             else g_orig[slot] = nullptr;
         }
     }
-    if (!anyModule) { info = "游戏还没加载 XInput"; return false; }
-    if (n == 0) { info = "游戏模块里没找到任何 XInputGetState 的指针"; return false; }
+    if (!anyModule) { info = i18n::Tr("游戏还没加载 XInput", "the game has not loaded XInput yet", "ゲームがまだ XInput を読み込んでいません"); return false; }
+    if (n == 0) { info = i18n::Tr("游戏模块里没找到任何 XInputGetState 的指针",
+                                  "no XInputGetState pointer found in game modules",
+                                  "ゲームのモジュールに XInputGetState のポインタが見つかりません"); return false; }
     g_installed = true;
-    info = "替换了 " + std::to_string(n) + " 处";
+    info = i18n::Fmt(i18n::Tr("替换了 %d 处", "patched %d slot(s)", "%d 箇所を差し替え"), n);
     return true;
 }
 
 bool Installed() { return g_installed; }
+
+bool Latest(unsigned long pad, unsigned short* buttons, unsigned char* lt, unsigned char* rt)
+{
+    if (pad >= XUSER_MAX_COUNT) return false;
+    const unsigned long long at = g_pub[pad].at.load();
+    if (!at || ::GetTickCount64() - at > 1000) return false;
+    if (buttons) *buttons = (unsigned short)g_pub[pad].buttons.load();
+    const unsigned t = g_pub[pad].triggers.load();
+    if (lt) *lt = (unsigned char)(t & 0xFF);
+    if (rt) *rt = (unsigned char)((t >> 8) & 0xFF);
+    return true;
+}
+
+std::string Profile()
+{
+    char b[96];
+    std::snprintf(b, sizeof(b), "XInputGetState %lld 次", g_calls.load());
+    return b;
+}
+
 void TestFilter(unsigned long pad, void* s) { Filter(pad, static_cast<XINPUT_STATE*>(s)); }
 void SetBlock(bool block) { g_block = block; }
-void SetChord(unsigned short mask) { g_chord = mask; }
 
 } // namespace padfilter

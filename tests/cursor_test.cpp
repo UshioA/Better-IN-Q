@@ -1,4 +1,4 @@
-// 光标过滤的测试：过滤器编进测试程序自己，被换掉的就是测试程序导入表里的
+﻿// 光标过滤的测试：过滤器编进测试程序自己，被换掉的就是测试程序导入表里的
 // SetCursorPos / GetCursorPos / ClipCursor，直接调 ::SetCursorPos 就经过钩子，和游戏一样。
 //
 // 会碰真实光标，但都放回原样：光标最后回到开始的位置；锁定范围只短暂改成
@@ -44,11 +44,18 @@ int main()
     CHECK(Same(a, b), "关着：GetCursorPos 读到真实位置 (%ld,%ld)", a.x, a.y);
 
     // ---- 面板开着：游戏挪不动光标，读到的是它想放的位置 ----
-    cursorfilter::SetBlock(true);
+    // 外面有别的东西在动光标时（桌面/远程桌面都有），SetBlock 抓位置的那一刻可能正好被挪了：
+    // 重试几次，要验的是「冻结的位置 = 开面板那一刻的真实位置」，不是「鼠标不会动」。
     POINT start{}, g{};
-    realGet(&start);
-    ::GetCursorPos(&g);
-    CHECK(Same(g, start), "开面板那一刻的位置被冻住 (%ld,%ld)", g.x, g.y);
+    bool frozen = false;
+    for (int attempt = 0; attempt < 5 && !frozen; ++attempt) {
+        realGet(&start);
+        cursorfilter::SetBlock(true);
+        ::GetCursorPos(&g);
+        frozen = Same(g, start);
+        if (!frozen) cursorfilter::SetBlock(false);
+    }
+    CHECK(frozen, "开面板那一刻的位置被冻住 (%ld,%ld)", g.x, g.y);
     const POINT t{start.x > 100 ? start.x - 50 : start.x + 50, start.y > 100 ? start.y - 50 : start.y + 50};
     CHECK(::SetCursorPos(t.x, t.y), "开着：SetCursorPos 返回成功");
     POINT now{};

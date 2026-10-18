@@ -28,9 +28,12 @@ struct Model {
     std::vector<LoadoutName> equipNames;  // 游戏里的装备套装名（打开面板时刷新）
     std::vector<LoadoutName> itemNames;   // 游戏里的道具套装名（按显示编号）
 
-    bool reqRestart = false;              // 立刻重开
+    bool reqRestart = false;              // 立刻重开（接任务 → 出发）
+    bool reqResetOnly = false;            // 只重置任务：回据点，不接任务也不出发
     bool reqSave = false;                 // 配置改了，存盘并生效
     bool reqClose = false;                // 关面板
+    bool reqImportInq = false;            // 文件选择框里挑好了 config.txt：请求导入
+    std::wstring inqPath;                 // 挑中的原版 config.txt（导入完清空）
 
     // 设置快捷键：主循环每轮填现在按着的键，面板录完写回配置
     unsigned padHeld = 0;                 // 手柄（XINPUT_GAMEPAD_* 位 + kPadLT/kPadRT，见 input.h）
@@ -57,5 +60,8 @@ void DebugStartCapture(Model& m, int row, bool pad);
 std::string DebugCaptureWhy();
 // 预览 / 宣传图用：往「换任务」的搜索框里填字
 void DebugSetSearch(const char* text);
+// 预览用：直接弹出「选原版 config.txt」的选择框 / 关掉它
+void DebugOpenPick();
+void DebugClosePick();
 
 } // namespace ui

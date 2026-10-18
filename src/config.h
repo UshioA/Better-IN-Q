@@ -30,12 +30,22 @@ struct Config {
     std::string activeSet;      // 重开时套用的全套，空 = 不套用
     int food = 0;               // 每次进任务都吃的猫饭，0 = 不管
     bool quickBlackout = true;  // 缩短转场黑屏
-    int panelOpacity = 80;      // 面板不透明度 %，越小越透
+    int panelOpacity = 80;
+    // HDR：auto = 看交换链色域自己判断；off / scrgb / hdr10 可强制。SdrNits = 播放器里
+    // 的「SDR 内容亮度」，HDR 下 UI 的白点按它对齐（一般 200~300）
+    std::string hdr = "auto";
+    int sdrNits = 203;      // 面板不透明度 %，越小越透
+
+    // 面板
+    // 面板不透明度 %，越小越透
+    std::string language = "auto";  // 界面语言 zh / en / ja，auto = 跟系统界面语言
     int debug = 0;
+    std::string debugDisable;   // [Debug] Disable：排查用，关掉指定的过滤器（pad/cursor/kbd/din/overlay）
 
     // [Hotkeys]  多个组合用 | 隔开，例如  LB+RB+LT+RT | Ctrl+R
     std::string hkRestart = "LB+RB+LT+RT";
-    std::string hkPanel = "View+Menu | Insert";
+    std::string hkPanel = "Insert";   // 只认键盘：手柄开面板靠不住（要扣留按键）
+    std::string hkResetOnly;    // 只重置任务（默认不设键，用面板上的按钮）
 
     std::vector<LoadoutSet> sets;
     std::map<int, FoodPreset> foods;

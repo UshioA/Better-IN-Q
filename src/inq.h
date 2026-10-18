@@ -19,7 +19,7 @@ struct State {
     volatile std::int32_t restart = 0;
     volatile std::uint8_t optReset = 0;       // INQ+4  重置后从据点重接（不勾 = 直接重开）
     volatile std::uint8_t optAcceptOnly = 0;  // INQ+5  只接任务不出发
-    // INQ+6 在 CT 里是「这一次只重置」（快捷键给的），这里不做这个功能
+    volatile std::uint8_t optResetOnly = 0;   // INQ+6  这一次只重置（不接任务、不出发）
     volatile std::uint8_t optWyvern = 0;      // INQ+7  普通地图用翼龙起始
     volatile std::uint32_t questId = 0;       // INQ+8  0 = 用上一次的任务
     volatile std::int32_t food = 0;           // INQ+C  进任务时套用的猫饭（编号，0 = 不管）
@@ -37,6 +37,10 @@ bool Ready();
 
 // 重开（快捷键或面板）。会先套用 Active 那套全套配置。重开方式看配置里的 Reset / AcceptOnly。
 void RequestRestart(const Config& cfg);
+
+// 只重置（原 IN-Q 的 Reset only / INQ+6）：把当前任务重置掉、回据点，不接任务也不出发。
+// 不套用全套配置 —— 这一趟只是把任务清掉。
+void RequestResetOnly();
 
 // 每 100ms 调一次（CT 里 Lua 定时器做的事）
 void Tick(const Config& cfg);

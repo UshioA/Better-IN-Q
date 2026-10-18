@@ -25,4 +25,8 @@ bool Installed();
 
 void SetBlock(bool block);   // 面板开着 → 游戏挪不动、锁不住光标
 
+// 诊断用：这一次开面板游戏读了几次光标位置（面板关掉时写进日志）
+void ResetStats();
+std::string Stats();
+
 } // namespace cursorfilter

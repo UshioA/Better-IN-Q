@@ -12,6 +12,7 @@
 #include "../src/config.h"
 #include "../src/overlay.h"
 #include "../src/ui.h"
+#include "../src/i18n.h"
 
 static int g_fail = 0;
 #define CHECK(cond, ...) do { if (cond) std::printf("  ok   " __VA_ARGS__); \
@@ -124,6 +125,7 @@ int wmain(int argc, wchar_t** argv)
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     std::string err;
     LoadConfig(L"config\\BetterINQ.ini", g_cfg, err);
+    i18n::Set(i18n::FromString(g_cfg.language));   // 面板语言跟着配置走，和 DLL 里一样
     g_model.cfg = &g_cfg;
     g_model.ready = true;
     g_model.version = "dx12";
