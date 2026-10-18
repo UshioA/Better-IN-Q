@@ -20,7 +20,7 @@ namespace {
 
 HMODULE g_module = nullptr;
 volatile LONG g_stop = 0;
-const char* const kVersion = "0.5.7";
+const char* const kVersion = "0.5.8";
 
 // 主循环线程和游戏渲染线程（画面板）共用，都要先拿这把锁
 std::mutex g_mx;
@@ -88,11 +88,14 @@ struct Hotkeys {
     }
 };
 
+bool g_blocked = false;   // 现在是不是在挡游戏的输入（面板开着）
+
 void SetPanel(bool open)
 {
     overlay::SetOpen(open);
-    padfilter::SetBlock(overlay::IsOpen());
-    cursorfilter::SetBlock(overlay::IsOpen());
+    g_blocked = overlay::IsOpen();
+    padfilter::SetBlock(g_blocked);
+    cursorfilter::SetBlock(g_blocked);
 }
 
 // 手柄、光标过滤：游戏的 XInput 可能晚一点才加载，装不上就隔两秒再试，最多试 2 分钟
@@ -178,8 +181,13 @@ DWORD WINAPI Worker(LPVOID)
             else g_model.keysHeld.clear();
         }
         if (in.Fired(hk.panel) && !capturing) {
-            if (overlay::Failed() || !panelOk) Chat("Better-IN-Q：面板不可用，详情见 BetterINQ.log");
+            if (overlay::Failed() || !panelOk) Chat("Better-IN-Q：面板只支持 DX11，游戏开着 DX12 时用不了（重开快捷键照常能用）");
             else SetPanel(!overlay::IsOpen());
+        }
+        // 面板刚打开就发现画不出来（DX12）：别一直挡着手柄和鼠标
+        if (g_blocked && overlay::Failed()) {
+            SetPanel(false);
+            Chat("Better-IN-Q：面板只支持 DX11，游戏开着 DX12 时用不了（重开快捷键照常能用）");
         }
         const bool open = overlay::IsOpen();
         const bool restartKey = in.Fired(hk.restart);       // 面板开着时不响应，免得在面板里误触

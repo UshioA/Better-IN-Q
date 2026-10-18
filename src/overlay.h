@@ -20,7 +20,7 @@ struct Callbacks {
 bool Install(const Callbacks& cb, std::string& err);
 void SetOpen(bool open);
 bool IsOpen();
-bool Failed();   // 渲染端初始化失败（比如游戏开的是 DX12），面板不可用
+bool Failed();   // 渲染端初始化失败（比如游戏开的是 DX12），面板不可用；这时 IsOpen() 一直是 false
 
 // 测试用：每帧画完、交给游戏 Present 之前回调一次，参数是 ID3D11Texture2D*（后台缓冲）
 void SetDebugAfterDraw(void (*fn)(void* backbuffer));

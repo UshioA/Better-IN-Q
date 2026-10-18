@@ -29,6 +29,9 @@ std::atomic<bool> g_open{false};
 bool g_wasOpen = false;
 bool g_inited = false;
 std::atomic<bool> g_failed{false};
+std::atomic<unsigned long long> g_openAt{0};   // 这次打开面板的时间（还没初始化成功时，用来判断要不要放弃）
+IDXGISwapChain* g_sc = nullptr;                // 游戏的交换链（只比指针，不持有引用）
+IDXGISwapChain* g_foreign = nullptr;           // 上一个确认过不是游戏的交换链，免得每帧再查
 HWND g_hwnd = nullptr;
 WNDPROC g_wndProc = nullptr;
 ID3D11Device* g_dev = nullptr;
@@ -69,17 +72,25 @@ bool CreateRtv(IDXGISwapChain* sc)
     return SUCCEEDED(hr);
 }
 
-void InitRenderer(IDXGISwapChain* sc)
+// 用这个交换链初始化。它不是 D3D11 的（游戏开着 DX12，或者是别的模组自己建的 DX12 交换链）就返回 false，
+// 不算失败：进程里所有交换链共用一张虚表，别人的 Present 也会走到这里。
+bool InitRenderer(IDXGISwapChain* sc)
 {
     if (FAILED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&g_dev))) || !g_dev) {
-        Log("overlay: 交换链不是 D3D11 的（DX12 模式？），面板不可用");
-        g_failed = true;
-        return;
+        g_dev = nullptr;
+        if (sc != g_foreign) {
+            g_foreign = sc;
+            DXGI_SWAP_CHAIN_DESC d{};
+            sc->GetDesc(&d);
+            Log("overlay: 跳过一个不是 D3D11 的交换链（缓冲 %ux%u）", d.BufferDesc.Width, d.BufferDesc.Height);
+        }
+        return false;
     }
     g_dev->GetImmediateContext(&g_ctx);
     DXGI_SWAP_CHAIN_DESC d{};
     sc->GetDesc(&d);
     g_hwnd = d.OutputWindow;
+    g_sc = sc;
     RECT rc{};
     ::GetClientRect(g_hwnd, &rc);
     const float h = (float)d.BufferDesc.Height;   // 字号按真实分辨率定，不按缩小后的窗口
@@ -90,13 +101,31 @@ void InitRenderer(IDXGISwapChain* sc)
     if (!ImGui_ImplWin32_Init(g_hwnd) || !ImGui_ImplDX11_Init(g_dev, g_ctx)) {
         Log("overlay: ImGui 后端初始化失败");
         g_failed = true;
-        return;
+        return false;
     }
     if (g_cb.init) g_cb.init(h > 0 ? h / 1080.0f : 1.0f);
     g_wndProc = reinterpret_cast<WNDPROC>(::SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WndProc)));
     g_inited = true;
     Log("overlay: 就绪（窗口 %ldx%ld，缓冲 %ux%u，格式 %d）", rc.right - rc.left, rc.bottom - rc.top,
         d.BufferDesc.Width, d.BufferDesc.Height, (int)d.BufferDesc.Format);
+    return true;
+}
+
+// 这一帧是不是游戏的交换链在 Present。游戏重建交换链（切全屏之类）时指针会变，
+// 同一个窗口、同一个设备的就认作新的游戏交换链。
+bool IsGameSwapChain(IDXGISwapChain* sc)
+{
+    if (sc == g_sc) return true;
+    if (sc == g_foreign) return false;
+    DXGI_SWAP_CHAIN_DESC d{};
+    ID3D11Device* dev = nullptr;
+    const bool same = SUCCEEDED(sc->GetDesc(&d)) && d.OutputWindow == g_hwnd &&
+                      SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev))) && dev == g_dev;
+    if (dev) dev->Release();
+    if (!same) { g_foreign = sc; return false; }
+    g_sc = sc;
+    ReleaseRtv();
+    return true;
 }
 
 void RenderPanel(IDXGISwapChain* sc)
@@ -146,15 +175,20 @@ HRESULT WINAPI HkPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     if (!g_failed.load() && !(flags & DXGI_PRESENT_TEST)) {
         // 第一次打开面板才初始化（要读字体文件），从没打开过就完全不碰游戏的渲染
-        if (!g_inited && g_open.load()) InitRenderer(sc);
-        if (g_inited) RenderPanel(sc);
+        if (!g_inited && g_open.load() && !InitRenderer(sc) && !g_failed.load() &&
+            ::GetTickCount64() - g_openAt.load() > 1500) {
+            // 开着面板 1.5 秒都没等到 D3D11 的交换链：游戏是 DX12 模式
+            Log("overlay: 游戏的交换链不是 D3D11 的（游戏开了 DX12？），面板不可用；重开快捷键不受影响");
+            g_failed = true;
+        }
+        if (g_inited && IsGameSwapChain(sc)) RenderPanel(sc);
     }
     return g_present(sc, sync, flags);
 }
 
 HRESULT WINAPI HkResize(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
 {
-    ReleaseRtv();   // 后台缓冲要被换掉了，先放手；下次画的时候再建
+    if (sc == g_sc) ReleaseRtv();   // 后台缓冲要被换掉了，先放手；下次画的时候再建
     return g_resize(sc, n, w, h, f, flags);
 }
 
@@ -224,8 +258,12 @@ bool Install(const Callbacks& cb, std::string& err)
     return true;
 }
 
-void SetOpen(bool open) { g_open = open && !g_failed.load(); }
-bool IsOpen() { return g_open.load(); }
+void SetOpen(bool open)
+{
+    if (open && !g_open.load()) g_openAt = ::GetTickCount64();
+    g_open = open && !g_failed.load();
+}
+bool IsOpen() { return g_open.load() && !g_failed.load(); }
 bool Failed() { return g_failed.load(); }
 void SetDebugAfterDraw(void (*fn)(void*)) { g_debugAfterDraw = fn; }
 

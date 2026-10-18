@@ -41,6 +41,10 @@ if [ "$WHAT" = "test" ] || [ "$WHAT" = "all" ]; then
         out/obj/imgui.o out/obj/imgui_draw.o out/obj/imgui_tables.o out/obj/imgui_widgets.o \
         out/obj/imgui_impl_dx11.o out/obj/imgui_impl_win32.o \
         -ld3d11 -ld3dcompiler -ldxgi -ldwmapi -limm32 -lgdi32 -lole32 -lwindowscodecs -luuid -lxinput
+    g++ $COMMON -I$IM -Isrc -o out/overlay_dx12_test.exe tests/overlay_dx12_test.cpp src/overlay.cpp src/log.cpp \
+        out/obj/imgui.o out/obj/imgui_draw.o out/obj/imgui_tables.o out/obj/imgui_widgets.o \
+        out/obj/imgui_impl_dx11.o out/obj/imgui_impl_win32.o \
+        -ld3d11 -ld3d12 -ld3dcompiler -ldxgi -ldwmapi -limm32 -lgdi32 -lole32 -luuid
     g++ $COMMON -I$IM -Isrc -o out/ui_nav_test.exe tests/ui_nav_test.cpp src/ui.cpp src/gamedata.cpp src/config.cpp src/input.cpp \
         out/obj/imgui.o out/obj/imgui_draw.o out/obj/imgui_tables.o out/obj/imgui_widgets.o out/obj/imgui_impl_dx11.o \
         -ld3d11 -ld3dcompiler
@@ -48,5 +52,6 @@ if [ "$WHAT" = "test" ] || [ "$WHAT" = "all" ]; then
     ./out/config_test.exe
     ./out/cursor_test.exe
     ./out/overlay_test.exe "$(cygpath -w "$PWD/out")"
+    ./out/overlay_dx12_test.exe
     ./out/ui_nav_test.exe
 fi

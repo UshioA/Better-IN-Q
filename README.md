@@ -28,6 +28,7 @@ Better-IN-Q 只在界面、bug 修复和使用体验上做了优化，没有参�
 
 设置会自动存到 `nativePC\plugins\BetterINQ\BetterINQ.ini`，日志在同目录的 `BetterINQ.log`。
 不要和 IN-Q.exe 同时开。
+面板只支持 DX11：游戏开着 DX12 时面板打不开（重开快捷键照常能用），想用面板请在游戏「选项 → 显示」里关掉 DirectX 12。
 
 ## 构建
 

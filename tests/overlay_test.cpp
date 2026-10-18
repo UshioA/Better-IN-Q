@@ -198,6 +198,27 @@ int wmain(int argc, wchar_t** argv)
         frame(0.25f, 0.35f, 0.25f);
     }
     for (int i = 0; i < 30; ++i) frame(0.25f, 0.35f, 0.25f);
+    // 进程里还有别人建的 D3D11 交换链（别的模组、工具窗口）：同一张虚表，Present 也会走到钩子里，
+    // 但面板只能画在游戏自己的交换链上
+    {
+        HWND hw2 = CreateWindowExW(0, wc.lpszClassName, L"other", WS_OVERLAPPEDWINDOW, 0, 0, 656, 519, nullptr, nullptr,
+                                   wc.hInstance, nullptr);
+        DXGI_SWAP_CHAIN_DESC sd2 = sd;
+        RECT rc2; GetClientRect(hw2, &rc2);
+        sd2.BufferDesc.Width = rc2.right; sd2.BufferDesc.Height = rc2.bottom; sd2.OutputWindow = hw2;
+        IDXGISwapChain* sc2 = nullptr; ID3D11Device* dev2 = nullptr; ID3D11DeviceContext* ctx2 = nullptr;
+        D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &sd2, &sc2,
+                                      &dev2, nullptr, &ctx2);
+        const int before = g_draws;
+        for (int i = 0; i < 5; ++i) if (sc2) sc2->Present(0, 0);
+        CHECK(sc2 && g_draws == before, "别人的交换链 Present 了 5 次：面板一次都没往上画（draws %d → %d）", before, g_draws);
+        frame(0.25f, 0.35f, 0.25f);
+        CHECK(g_draws == before + 1, "游戏自己的交换链照常画（draws=%d）", g_draws);
+        if (sc2) sc2->Release();
+        if (ctx2) ctx2->Release();
+        if (dev2) dev2->Release();
+        DestroyWindow(hw2);
+    }
     const int drawsBefore = g_draws;
 
     // 改分辨率：游戏切窗口大小时会调 ResizeBuffers，之前的后台缓冲引用必须先放掉，否则会失败
