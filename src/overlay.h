@@ -2,6 +2,7 @@
 // ============================================================================
 //  overlay.h —— 把面板画到游戏画面上（DX11）
 //
+//  D3D11 和 D3D12 都支持（游戏的「DirectX 12」开关开不开都能用）。
 //  挂的是交换链虚表里的 Present / ResizeBuffers 两项（同一个类的交换链共用一张虚表，
 //  拿临时建的交换链就能找到它）。不改函数开头的字节：Steam 叠加层之类挂了 Present
 //  函数本身的话，我们调用原指针时自然经过它们，大家串在一起互不干扰。
@@ -24,5 +25,7 @@ bool Failed();   // 渲染端初始化失败（比如游戏开的是 DX12），�
 
 // 测试用：每帧画完、交给游戏 Present 之前回调一次，参数是 ID3D11Texture2D*（后台缓冲）
 void SetDebugAfterDraw(void (*fn)(void* backbuffer));
+// 同上，D3D12：参数是 ID3D12Resource*（后台缓冲，处于 PRESENT 状态）和 ID3D12CommandQueue*（游戏的队列）
+void SetDebugAfterDraw12(void (*fn)(void* backbuffer, void* queue));
 
 } // namespace overlay

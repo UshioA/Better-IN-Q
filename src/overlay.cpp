@@ -1,17 +1,23 @@
+// MinGW 的 d3d12.h 默认按 GCC 的规矩返回结构体（GetDesc、GetCPUDescriptorHandleForHeapStart 之类），
+// 和 COM 实际的调用约定（隐藏的返回指针）对不上，会读到错的值。打开这个开关就按 COM 的来。
+#define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include "overlay.h"
 
 #include "log.h"
 
 #include <windows.h>
 #include <d3d11.h>
-#include <dxgi.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
 #include <atomic>
+#include <vector>
 
 #include <cfloat>
 
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "backends/imgui_impl_dx11.h"
+#include "backends/imgui_impl_dx12.h"
 #include "backends/imgui_impl_win32.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
@@ -21,24 +27,53 @@ namespace {
 
 typedef HRESULT(WINAPI* PresentFn)(IDXGISwapChain*, UINT, UINT);
 typedef HRESULT(WINAPI* ResizeFn)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+typedef HRESULT(WINAPI* Resize1Fn)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT*, IUnknown* const*);
+typedef void(WINAPI* ExecuteFn)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+
+enum Api { kNone, kD3D11, kD3D12 };
 
 Callbacks g_cb;
 PresentFn g_present = nullptr;
 ResizeFn g_resize = nullptr;
+Resize1Fn g_resize1 = nullptr;
 std::atomic<bool> g_open{false};
 bool g_wasOpen = false;
 bool g_inited = false;
+Api g_api = kNone;
 std::atomic<bool> g_failed{false};
 std::atomic<unsigned long long> g_openAt{0};   // 这次打开面板的时间（还没初始化成功时，用来判断要不要放弃）
 IDXGISwapChain* g_sc = nullptr;                // 游戏的交换链（只比指针，不持有引用）
 IDXGISwapChain* g_foreign = nullptr;           // 上一个确认过不是游戏的交换链，免得每帧再查
 HWND g_hwnd = nullptr;
 WNDPROC g_wndProc = nullptr;
+void (*g_debugAfterDraw)(void*) = nullptr;
+void (*g_debugAfterDraw12)(void*, void*) = nullptr;
+ImU32 g_lastScaledEvent = 0;
+
+// ---- D3D11
 ID3D11Device* g_dev = nullptr;
 ID3D11DeviceContext* g_ctx = nullptr;
 ID3D11RenderTargetView* g_rtv = nullptr;
-void (*g_debugAfterDraw)(void*) = nullptr;
-ImU32 g_lastScaledEvent = 0;
+
+// ---- D3D12
+// 交换链拿不到它的命令队列，只能挂 ExecuteCommandLists，等游戏自己提交时把队列记下来
+ExecuteFn g_execute = nullptr;
+std::atomic<ID3D12Device*> g_wantQueueOf{nullptr};   // 要找哪个设备的队列
+std::atomic<ID3D12CommandQueue*> g_queue{nullptr};
+ID3D12Device* g_dev12 = nullptr;
+IDXGISwapChain3* g_sc3 = nullptr;
+ID3D12DescriptorHeap* g_rtvHeap = nullptr;
+ID3D12DescriptorHeap* g_srvHeap = nullptr;
+UINT g_rtvInc = 0, g_srvInc = 0;
+std::vector<int> g_srvFree;                    // ImGui 要的纹理描述符，从 g_srvHeap 里分
+ID3D12GraphicsCommandList* g_list = nullptr;
+ID3D12Fence* g_fence = nullptr;
+UINT64 g_fenceVal = 0;
+HANDLE g_fenceEvent = nullptr;
+constexpr UINT kMaxBuffers = 16;
+ID3D12CommandAllocator* g_alloc[kMaxBuffers] = {};
+UINT64 g_allocFence[kMaxBuffers] = {};
+DXGI_FORMAT g_bbFormat = DXGI_FORMAT_UNKNOWN;
 
 // 面板开着时把键鼠消息吃掉，游戏收不到（手柄另由 padfilter 挡）
 LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
@@ -58,6 +93,17 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
     return ::CallWindowProcW(g_wndProc, h, msg, w, l);
 }
 
+bool PatchSlot(void** slot, void* hook, void** orig)
+{
+    DWORD old = 0;
+    if (!::VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return false;
+    *orig = *slot;
+    *slot = hook;
+    ::VirtualProtect(slot, sizeof(void*), old, &old);
+    return true;
+}
+
+// ================================================================ D3D11
 void ReleaseRtv()
 {
     if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
@@ -72,25 +118,180 @@ bool CreateRtv(IDXGISwapChain* sc)
     return SUCCEEDED(hr);
 }
 
-// 用这个交换链初始化。它不是 D3D11 的（游戏开着 DX12，或者是别的模组自己建的 DX12 交换链）就返回 false，
-// 不算失败：进程里所有交换链共用一张虚表，别人的 Present 也会走到这里。
-bool InitRenderer(IDXGISwapChain* sc)
+// ================================================================ D3D12
+void WINAPI HkExecute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
 {
-    if (FAILED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&g_dev))) || !g_dev) {
-        g_dev = nullptr;
-        if (sc != g_foreign) {
-            g_foreign = sc;
-            DXGI_SWAP_CHAIN_DESC d{};
-            sc->GetDesc(&d);
-            Log("overlay: 跳过一个不是 D3D11 的交换链（缓冲 %ux%u）", d.BufferDesc.Width, d.BufferDesc.Height);
+    ID3D12Device* want = g_wantQueueOf.load();
+    if (want && !g_queue.load() && q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        ID3D12Device* d = nullptr;
+        if (SUCCEEDED(q->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&d))) && d) {
+            if (d == want) {
+                ID3D12CommandQueue* expected = nullptr;
+                if (g_queue.compare_exchange_strong(expected, q)) Log("overlay: 记下游戏的 D3D12 命令队列 %p", (void*)q);
+            }
+            d->Release();
         }
-        return false;
     }
-    g_dev->GetImmediateContext(&g_ctx);
+    g_execute(q, n, lists);
+}
+
+// 在游戏的设备上建一个临时队列，拿到队列的虚表，挂 ExecuteCommandLists（第 10 项）
+bool HookExecute(ID3D12Device* dev)
+{
+    if (g_execute) return true;
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ID3D12CommandQueue* tmp = nullptr;
+    if (FAILED(dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&tmp))) || !tmp) return false;
+    void** vt = *reinterpret_cast<void***>(tmp);
+    const bool ok = PatchSlot(&vt[10], reinterpret_cast<void*>(HkExecute), reinterpret_cast<void**>(&g_execute));
+    tmp->Release();
+    Log("overlay: %s ExecuteCommandLists", ok ? "已挂" : "挂不上");
+    return ok;
+}
+
+void SrvAlloc(ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE* cpu, D3D12_GPU_DESCRIPTOR_HANDLE* gpu)
+{
+    const int i = g_srvFree.empty() ? 0 : g_srvFree.back();
+    if (!g_srvFree.empty()) g_srvFree.pop_back();
+    *cpu = g_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    *gpu = g_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    cpu->ptr += (SIZE_T)i * g_srvInc;
+    gpu->ptr += (UINT64)i * g_srvInc;
+}
+
+void SrvFree(ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE cpu, D3D12_GPU_DESCRIPTOR_HANDLE)
+{
+    g_srvFree.push_back((int)((cpu.ptr - g_srvHeap->GetCPUDescriptorHandleForHeapStart().ptr) / g_srvInc));
+}
+
+void WaitGpu12()
+{
+    ID3D12CommandQueue* q = g_queue.load();
+    if (!q || !g_fence) return;
+    q->Signal(g_fence, ++g_fenceVal);
+    if (g_fence->GetCompletedValue() < g_fenceVal) {
+        g_fence->SetEventOnCompletion(g_fenceVal, g_fenceEvent);
+        ::WaitForSingleObject(g_fenceEvent, 2000);
+    }
+}
+
+// 0 = 用不了，1 = 好了，2 = 是 D3D12 的，但还没等到游戏的命令队列
+int InitD3D12Objects(IDXGISwapChain* sc, ID3D12Device* dev)
+{
+    if (!HookExecute(dev)) return 0;
+    g_wantQueueOf = dev;
+    ID3D12CommandQueue* q = g_queue.load();
+    if (!q) return 2;
+    if (FAILED(sc->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&g_sc3))) || !g_sc3) return 0;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.NumDescriptors = kMaxBuffers;
+    if (FAILED(dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&g_rtvHeap)))) return 0;
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 64;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&g_srvHeap)))) return 0;
+    for (int i = 63; i >= 0; --i) g_srvFree.push_back(i);
+    g_rtvInc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    g_srvInc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&g_fence)))) return 0;
+    g_fenceEvent = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    for (UINT i = 0; i < kMaxBuffers; ++i)
+        if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                               reinterpret_cast<void**>(&g_alloc[i])))) return 0;
+    if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc[0], nullptr, __uuidof(ID3D12GraphicsCommandList),
+                                      reinterpret_cast<void**>(&g_list)))) return 0;
+    g_list->Close();
+    g_dev12 = dev;
+    return 1;
+}
+
+void Render12(IDXGISwapChain* sc, ImDrawData* dd)
+{
+    ID3D12CommandQueue* q = g_queue.load();
+    const UINT i = g_sc3->GetCurrentBackBufferIndex();
+    if (i >= kMaxBuffers) return;
+    // 每帧现拿后台缓冲、用完就放：不长期持有引用，游戏 ResizeBuffers / 重建交换链都不受影响
+    ID3D12Resource* bb = nullptr;
+    if (FAILED(sc->GetBuffer(i, __uuidof(ID3D12Resource), reinterpret_cast<void**>(&bb))) || !bb) return;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += (SIZE_T)i * g_rtvInc;
+    g_dev12->CreateRenderTargetView(bb, nullptr, rtv);
+
+    if (g_fence->GetCompletedValue() < g_allocFence[i]) {        // 这块分配器上次的命令还没跑完
+        g_fence->SetEventOnCompletion(g_allocFence[i], g_fenceEvent);
+        ::WaitForSingleObject(g_fenceEvent, 1000);
+    }
+    g_alloc[i]->Reset();
+    g_list->Reset(g_alloc[i], nullptr);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = bb;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g_list->ResourceBarrier(1, &b);
+    g_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    g_list->SetDescriptorHeaps(1, &g_srvHeap);
+    ImGui_ImplDX12_RenderDrawData(dd, g_list);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    g_list->ResourceBarrier(1, &b);
+    g_list->Close();
+    ID3D12CommandList* lists[] = {g_list};
+    g_execute(q, 1, lists);
+    q->Signal(g_fence, ++g_fenceVal);
+    g_allocFence[i] = g_fenceVal;
+    if (g_debugAfterDraw12) g_debugAfterDraw12(bb, q);
+    bb->Release();
+}
+
+// ================================================================ 公共
+// 用这个交换链初始化。0 = 用不了（别人的、或者是 D3D11/12 以外的），1 = 好了，2 = 等一等（D3D12 还没拿到命令队列）。
+// 用不了不算失败：进程里所有交换链共用一张虚表，别人的 Present 也会走到这里。
+int InitRenderer(IDXGISwapChain* sc)
+{
+    if (sc == g_foreign) return 0;
+    // 按快捷键时游戏窗口在前台（快捷键只在游戏有焦点时才响应）：别的窗口的交换链（别的模组、工具）不认
+    HWND fg = ::GetForegroundWindow();
+    DWORD pid = 0;
+    ::GetWindowThreadProcessId(fg, &pid);
+    if (fg && pid == ::GetCurrentProcessId()) {
+        DXGI_SWAP_CHAIN_DESC d{};
+        if (SUCCEEDED(sc->GetDesc(&d)) && d.OutputWindow != fg && ::GetAncestor(d.OutputWindow, GA_ROOT) != fg) {
+            g_foreign = sc;
+            return 0;
+        }
+    }
+    ID3D12Device* dev12 = nullptr;
+    g_dev = nullptr;
+    if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&g_dev))) && g_dev) {
+        g_dev->GetImmediateContext(&g_ctx);
+        g_api = kD3D11;
+    } else if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dev12))) && dev12) {
+        g_dev = nullptr;
+        const int r = InitD3D12Objects(sc, dev12);
+        dev12->Release();            // 设备归游戏管，交换链活着它就活着
+        if (r == 0) {                // 是 D3D12 的游戏画面，但建不起我们要的东西：别每帧重试
+            Log("overlay: D3D12 初始化失败，面板不可用；重开快捷键不受影响");
+            g_failed = true;
+        }
+        if (r != 1) return r;
+        g_api = kD3D12;
+    } else {
+        g_dev = nullptr;
+        g_foreign = sc;
+        DXGI_SWAP_CHAIN_DESC d{};
+        sc->GetDesc(&d);
+        Log("overlay: 跳过一个既不是 D3D11 也不是 D3D12 的交换链（缓冲 %ux%u）", d.BufferDesc.Width, d.BufferDesc.Height);
+        return 0;
+    }
     DXGI_SWAP_CHAIN_DESC d{};
     sc->GetDesc(&d);
     g_hwnd = d.OutputWindow;
     g_sc = sc;
+    g_bbFormat = d.BufferDesc.Format;
     RECT rc{};
     ::GetClientRect(g_hwnd, &rc);
     const float h = (float)d.BufferDesc.Height;   // 字号按真实分辨率定，不按缩小后的窗口
@@ -98,17 +299,32 @@ bool InitRenderer(IDXGISwapChain* sc)
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().BackendFlags |= ImGuiBackendFlags_HasGamepad;
-    if (!ImGui_ImplWin32_Init(g_hwnd) || !ImGui_ImplDX11_Init(g_dev, g_ctx)) {
+    bool ok = ImGui_ImplWin32_Init(g_hwnd);
+    if (ok && g_api == kD3D11) {
+        ok = ImGui_ImplDX11_Init(g_dev, g_ctx);
+    } else if (ok) {
+        ImGui_ImplDX12_InitInfo info;
+        info.Device = g_dev12;
+        info.CommandQueue = g_queue.load();
+        info.NumFramesInFlight = (int)(d.BufferCount < 2 ? 2 : d.BufferCount);
+        info.RTVFormat = d.BufferDesc.Format;
+        info.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        info.SrvDescriptorHeap = g_srvHeap;
+        info.SrvDescriptorAllocFn = SrvAlloc;
+        info.SrvDescriptorFreeFn = SrvFree;
+        ok = ImGui_ImplDX12_Init(&info);
+    }
+    if (!ok) {
         Log("overlay: ImGui 后端初始化失败");
         g_failed = true;
-        return false;
+        return 0;
     }
     if (g_cb.init) g_cb.init(h > 0 ? h / 1080.0f : 1.0f);
     g_wndProc = reinterpret_cast<WNDPROC>(::SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WndProc)));
     g_inited = true;
-    Log("overlay: 就绪（窗口 %ldx%ld，缓冲 %ux%u，格式 %d）", rc.right - rc.left, rc.bottom - rc.top,
-        d.BufferDesc.Width, d.BufferDesc.Height, (int)d.BufferDesc.Format);
-    return true;
+    Log("overlay: 就绪（%s，窗口 %ldx%ld，缓冲 %ux%u x%u，格式 %d）", g_api == kD3D11 ? "D3D11" : "D3D12",
+        rc.right - rc.left, rc.bottom - rc.top, d.BufferDesc.Width, d.BufferDesc.Height, d.BufferCount, (int)d.BufferDesc.Format);
+    return 1;
 }
 
 // 这一帧是不是游戏的交换链在 Present。游戏重建交换链（切全屏之类）时指针会变，
@@ -118,10 +334,20 @@ bool IsGameSwapChain(IDXGISwapChain* sc)
     if (sc == g_sc) return true;
     if (sc == g_foreign) return false;
     DXGI_SWAP_CHAIN_DESC d{};
-    ID3D11Device* dev = nullptr;
-    const bool same = SUCCEEDED(sc->GetDesc(&d)) && d.OutputWindow == g_hwnd &&
-                      SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev))) && dev == g_dev;
-    if (dev) dev->Release();
+    bool same = SUCCEEDED(sc->GetDesc(&d)) && d.OutputWindow == g_hwnd;
+    if (same && g_api == kD3D11) {
+        ID3D11Device* dev = nullptr;
+        same = SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev))) && dev == g_dev;
+        if (dev) dev->Release();
+    } else if (same) {
+        ID3D12Device* dev = nullptr;
+        IDXGISwapChain3* sc3 = nullptr;
+        same = SUCCEEDED(sc->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dev))) && dev == g_dev12 &&
+               d.BufferDesc.Format == g_bbFormat &&
+               SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&sc3)));
+        if (dev) dev->Release();
+        if (same) { g_sc3->Release(); g_sc3 = sc3; }
+    }
     if (!same) { g_foreign = sc; return false; }
     g_sc = sc;
     ReleaseRtv();
@@ -134,9 +360,10 @@ void RenderPanel(IDXGISwapChain* sc)
     if (open && !g_wasOpen && g_cb.opened) g_cb.opened();
     g_wasOpen = open;
     if (!open) return;
-    if (!g_rtv && !CreateRtv(sc)) return;
+    if (g_api == kD3D11 && !g_rtv && !CreateRtv(sc)) return;
 
-    ImGui_ImplDX11_NewFrame();
+    if (g_api == kD3D11) ImGui_ImplDX11_NewFrame();
+    else ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGuiIO& io = ImGui::GetIO();
     io.MouseDrawCursor = true;   // 游戏把系统光标藏了，面板开着时自己画一个
@@ -159,6 +386,10 @@ void RenderPanel(IDXGISwapChain* sc)
     ImGui::NewFrame();
     if (g_cb.draw) g_cb.draw(io.DisplaySize.x, io.DisplaySize.y);
     ImGui::Render();
+    if (g_api == kD3D12) {
+        Render12(sc, ImGui::GetDrawData());
+        return;
+    }
     g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
@@ -175,25 +406,44 @@ HRESULT WINAPI HkPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     if (!g_failed.load() && !(flags & DXGI_PRESENT_TEST)) {
         // 第一次打开面板才初始化（要读字体文件），从没打开过就完全不碰游戏的渲染
-        if (!g_inited && g_open.load() && !InitRenderer(sc) && !g_failed.load() &&
-            ::GetTickCount64() - g_openAt.load() > 1500) {
-            // 开着面板 1.5 秒都没等到 D3D11 的交换链：游戏是 DX12 模式
-            Log("overlay: 游戏的交换链不是 D3D11 的（游戏开了 DX12？），面板不可用；重开快捷键不受影响");
-            g_failed = true;
+        if (!g_inited && g_open.load()) {
+            const int r = InitRenderer(sc);
+            // D3D12 要等游戏提交一次命令才知道它的队列，多给点时间
+            const unsigned long long limit = r == 2 ? 4000 : 1500;
+            if (r != 1 && !g_failed.load() && ::GetTickCount64() - g_openAt.load() > limit) {
+                Log(r == 2 ? "overlay: 等不到游戏的 D3D12 命令队列，面板不可用；重开快捷键不受影响"
+                           : "overlay: 没找到能画面板的交换链（D3D11 / D3D12 都不是），面板不可用；重开快捷键不受影响");
+                g_failed = true;
+            }
         }
         if (g_inited && IsGameSwapChain(sc)) RenderPanel(sc);
     }
     return g_present(sc, sync, flags);
 }
 
+// 游戏要换后台缓冲：D3D11 先放掉手上的 RTV；D3D12 等自己提交的命令跑完（缓冲本来就不长期持有）
+void BeforeResize(IDXGISwapChain* sc)
+{
+    if (sc != g_sc) return;
+    if (g_api == kD3D11) ReleaseRtv();
+    else if (g_api == kD3D12) WaitGpu12();
+}
+
 HRESULT WINAPI HkResize(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
 {
-    if (sc == g_sc) ReleaseRtv();   // 后台缓冲要被换掉了，先放手；下次画的时候再建
+    BeforeResize(sc);
     return g_resize(sc, n, w, h, f, flags);
 }
 
-// 建一个临时窗口和交换链，只为拿到交换链的虚表
-void** GetSwapChainVtable(std::string& err)
+HRESULT WINAPI HkResize1(IDXGISwapChain3* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags, const UINT* mask,
+                         IUnknown* const* queues)
+{
+    BeforeResize(sc);
+    return g_resize1(sc, n, w, h, f, flags, mask, queues);
+}
+
+// 建一个临时窗口和交换链，只为拿到交换链的虚表（D3D11 和 D3D12 的交换链是同一个类，共用这张表）
+void** GetSwapChainVtable(std::string& err, void*** vt3)
 {
     WNDCLASSEXW wc{sizeof(wc)};
     wc.lpfnWndProc = ::DefWindowProcW;
@@ -221,8 +471,17 @@ void** GetSwapChainVtable(std::string& err)
         hr = ::D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
                                              D3D11_SDK_VERSION, &sd, &sc, &dev, nullptr, &ctx);
     void** vt = nullptr;
-    if (SUCCEEDED(hr) && sc) vt = *reinterpret_cast<void***>(sc);
-    else err = "建临时交换链失败 hr=" + std::to_string((long)hr);
+    *vt3 = nullptr;
+    if (SUCCEEDED(hr) && sc) {
+        vt = *reinterpret_cast<void***>(sc);
+        IDXGISwapChain3* sc3 = nullptr;
+        if (SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&sc3))) && sc3) {
+            *vt3 = *reinterpret_cast<void***>(sc3);
+            sc3->Release();
+        }
+    } else {
+        err = "建临时交换链失败 hr=" + std::to_string((long)hr);
+    }
     if (sc) sc->Release();
     if (ctx) ctx->Release();
     if (dev) dev->Release();
@@ -231,29 +490,22 @@ void** GetSwapChainVtable(std::string& err)
     return vt;
 }
 
-bool PatchSlot(void** slot, void* hook, void** orig)
-{
-    DWORD old = 0;
-    if (!::VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return false;
-    *orig = *slot;
-    *slot = hook;
-    ::VirtualProtect(slot, sizeof(void*), old, &old);
-    return true;
-}
-
 } // namespace
 
 bool Install(const Callbacks& cb, std::string& err)
 {
     g_cb = cb;
-    void** vt = GetSwapChainVtable(err);
+    void** vt3 = nullptr;
+    void** vt = GetSwapChainVtable(err, &vt3);
     if (!vt) return false;
-    // IDXGISwapChain 虚表：8 = Present，13 = ResizeBuffers
+    // IDXGISwapChain 虚表：8 = Present，13 = ResizeBuffers；IDXGISwapChain3：39 = ResizeBuffers1（DX12 游戏可能用它）
     if (!PatchSlot(&vt[8], reinterpret_cast<void*>(HkPresent), reinterpret_cast<void**>(&g_present)) ||
         !PatchSlot(&vt[13], reinterpret_cast<void*>(HkResize), reinterpret_cast<void**>(&g_resize))) {
         err = "改交换链虚表失败";
         return false;
     }
+    if (vt3 && !PatchSlot(&vt3[39], reinterpret_cast<void*>(HkResize1), reinterpret_cast<void**>(&g_resize1)))
+        Log("overlay: ResizeBuffers1 没挂上（不影响 D3D11）");
     Log("overlay: Present 已挂（原 %p）", reinterpret_cast<void*>(g_present));
     return true;
 }
@@ -266,5 +518,6 @@ void SetOpen(bool open)
 bool IsOpen() { return g_open.load() && !g_failed.load(); }
 bool Failed() { return g_failed.load(); }
 void SetDebugAfterDraw(void (*fn)(void*)) { g_debugAfterDraw = fn; }
+void SetDebugAfterDraw12(void (*fn)(void*, void*)) { g_debugAfterDraw12 = fn; }
 
 } // namespace overlay

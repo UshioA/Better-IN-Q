@@ -28,7 +28,7 @@ Better-IN-Q 只在界面、bug 修复和使用体验上做了优化，没有参�
 
 设置会自动存到 `nativePC\plugins\BetterINQ\BetterINQ.ini`，日志在同目录的 `BetterINQ.log`。
 不要和 IN-Q.exe 同时开。
-面板只支持 DX11：游戏开着 DX12 时面板打不开（重开快捷键照常能用），想用面板请在游戏「选项 → 显示」里关掉 DirectX 12。
+游戏的 DirectX 12 开不开都能用：面板支持 DX11 和 DX12。
 
 ## 构建
 
@@ -50,7 +50,7 @@ py -3 tools/make_zip.py   # 打发布包
 | `src/main.cpp` | 插件入口、主循环、快捷键 |
 | `src/inq.*` | 重开的状态机和游戏挂钩（移植自 INQ.CT） |
 | `src/hook.*` | 往游戏代码里插跳转、按值换函数指针 |
-| `src/overlay.*` | 挂 DXGI Present，用 Dear ImGui 画面板 |
+| `src/overlay.*` | 挂 DXGI Present，用 Dear ImGui 画面板（D3D11 / D3D12） |
 | `src/ui.*` | 面板界面 |
 | `src/padfilter.*` / `src/cursorfilter.*` | 面板开着时挡住游戏的手柄输入、不让游戏拽鼠标 |
 | `src/config.*` / `src/input.*` / `src/gamedata.*` | 配置文件、快捷键、任务表 |
