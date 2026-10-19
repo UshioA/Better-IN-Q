@@ -3,6 +3,7 @@
 
 #include "gamedata.h"
 #include "i18n.h"
+#include "log.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "input.h"
@@ -48,6 +49,26 @@ int g_focus = 2;
 bool g_focusUsed = false;
 int g_editSet = -1;         // 正在编辑的全套（cfg.sets 下标）
 int g_editFood = 0;         // 正在编辑的猫饭编号
+// 改名：列表里选中一项后按 X（手柄）或 F（键盘）弹输入框
+enum RenameKind { kRenameNone, kRenameSet, kRenameFood };
+RenameKind g_renameKind = kRenameNone;
+int g_renameId = 0;              // 套装 = cfg.sets 下标；猫饭 = 编号
+std::string g_mouseDownRow;      // 鼠标按下的那一行（Selectable 要松开才回 true，先记住是谁）
+char g_renameBuf[96] = {};
+bool g_renameFocus = false;      // 刚打开：这一帧把光标放进输入框
+bool g_renameOpen = false;       // 上一帧弹着（用来发现被 B / Esc 关掉）
+bool g_renameCloseReq = false;   // 预览用：下一帧关掉
+bool g_debugRename = false;      // 预览用：下一帧弹出来
+std::string g_renameErr;
+bool g_renameCreate = false;      // 新建时直接弹出来起名（空 = 用默认名）
+int g_afterRename = 0;            // 起完名去哪个编辑页：1 = 套装，2 = 猫饭
+// 排序：按下左摇杆把选中的那一项放进「移动」模式，上下键换位置，再按一次放下
+enum MoveKind { kMoveNone, kMoveSet, kMoveFood };
+MoveKind g_moveKind = kMoveNone;
+int g_moveId = 0;
+float g_listScroll = 0;            // 套装/猫饭列表这一帧的滚动位置（测试用）
+int g_focusId = 0;                // 放下后把焦点还给刚移动的那一项
+const int kMaxNameChars = 50;      // 名字最多 50 个字（按字符算，中英文一样）
 int g_questTarget = -1;     // 给谁选任务：-1 = 全局，>=0 = cfg.sets[i]
 char g_search[96] = {};
 int g_scrollToSel = 0;      // 还要把选中的任务滚到视野里几帧（新建的列表头一帧还不知道自己多长，滚不过去）
@@ -88,13 +109,17 @@ Page MainOf(Page p)
 // 主页显示的、重开时真正会进的任务：当前套装指定了任务就用套装的
 int EffectiveQuest(const Config& c)
 {
-    if (const LoadoutSet* s = c.FindSet(c.activeSet))
+    if (const LoadoutSet* s = c.FindSetById(c.activeSet))
         if (s->quest) return s->quest;
     return c.questId;
 }
 
 void Go(Page p)
 {
+    // 换页就退出移动模式：不然在移动中按 B 回到上一页，再进来还停在「移动中」，
+    // 而且 L3 会被当成「放下」，再也进不去移动（用户报过这个）
+    g_moveKind = kMoveNone;
+    g_moveId = 0;
     g_page = p;
     g_focus = 2;
     if (p == kQuests) { g_search[0] = 0; g_scrollToSel = 3; g_questInit = true; }
@@ -288,11 +313,14 @@ bool RoundButton(const char* id, Icon icon, const char* label, float colW)
 }
 
 // 整行可点的列表项：左边主文字，右边次要文字
-bool Row(const char* id, const char* left, const char* right, bool selected, float h = 0)
+bool Row(const char* id, const char* left, const char* right, bool selected, float h = 0, bool quiet = false)
 {
     if (h <= 0) h = 46 * S;
     ImGui::PushID(id);
+    // quiet：不画 ImGui 自己的导航框（移动模式里我们自己描金边，两层框叠着难看）
+    if (quiet) ImGui::PushStyleColor(ImGuiCol_NavCursor, IM_COL32(0, 0, 0, 0));
     const bool pressed = ImGui::Selectable("##row", selected, ImGuiSelectableFlags_None, ImVec2(0, h));
+    if (quiet) ImGui::PopStyleColor();
     const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float rightW = 0;
@@ -450,13 +478,117 @@ std::string FoodSummary(const FoodPreset& f)
     return s;
 }
 
-std::string SetSummary(const LoadoutSet& s)
+// 猫饭在界面上的名字：起了名字就用名字，没起就显示序号
+std::string FoodLabel(const Config& c, int id)
+{
+    auto it = c.foods.find(id);
+    if (it != c.foods.end() && !it->second.name.empty()) return it->second.name;
+    return i18n::Fmt(i18n::Tr("猫饭 %d", "Meal %d", "猫飯 %d"), id);
+}
+
+// 名字首尾的空格去掉（中间的不动，中文名字里偶尔有空格是对的）
+std::string TrimName(const char* s)
+{
+    std::string r = s ? s : "";
+    std::size_t b = r.find_first_not_of(" \t");
+    if (b == std::string::npos) return std::string();
+    std::size_t e = r.find_last_not_of(" \t");
+    return r.substr(b, e - b + 1);
+}
+
+// 名字有几个字：UTF-8 里只数每个字符的首字节，一个汉字算 1 个字
+int CountChars(const char* s)
+{
+    int n = 0;
+    for (const unsigned char* p = (const unsigned char*)(s ? s : ""); *p; ++p)
+        if ((*p & 0xC0) != 0x80) ++n;
+    return n;
+}
+
+// 超长就砍掉尾巴。按首字节砍，不会把多字节字符切成半个
+void CutChars(char* s, int max)
+{
+    int n = 0;
+    for (char* p = s; *p; ++p) {
+        if (((unsigned char)*p & 0xC0) != 0x80 && ++n == max + 1) { *p = 0; return; }
+    }
+}
+
+void OpenRename(Model& m, RenameKind kind, int id)
+{
+    g_renameCreate = false;
+    g_afterRename = 0;
+    if (!m.cfg) return;
+    std::string cur;
+    if (kind == kRenameSet) {
+        if (id < 0 || id >= (int)m.cfg->sets.size()) return;
+        cur = m.cfg->sets[id].name;
+    } else if (kind == kRenameFood) {
+        cur = FoodLabel(*m.cfg, id);
+    } else {
+        return;
+    }
+    g_renameKind = kind;
+    g_renameId = id;
+    g_renameErr.clear();
+    std::snprintf(g_renameBuf, sizeof(g_renameBuf), "%s", cur.c_str());
+    g_renameFocus = true;
+    g_renameOpen = false;
+}
+
+// 新建时先建出来（默认名），再弹框让用户直接起名；确认或取消都进编辑页
+void OpenRenameCreate(Model& m, RenameKind kind, int id)
+{
+    if (!m.cfg) return;
+    g_renameKind = kind;
+    g_renameId = id;
+    g_renameCreate = true;
+    g_renameErr.clear();
+    g_renameBuf[0] = 0;
+    g_renameFocus = true;
+    g_renameOpen = false;
+}
+
+// 移动模式下把选中的那一项往上 / 往下挪一格。套装是换 vector 里的位置（编号跟着走），
+// 猫饭只改显示顺序（foodOrder），编号不动
+void MoveItem(Model& m, int dir)
+{
+    Config& c = *m.cfg;
+    Log("ui: MoveItem dir=%d kind=%d id=%d", dir, (int)g_moveKind, g_moveId);
+    if (g_moveKind == kMoveSet) {
+        int idx = -1;
+        for (int i = 0; i < (int)c.sets.size(); ++i) if (c.sets[i].id == g_moveId) { idx = i; break; }
+        if (idx < 0) return;
+        const int to = idx + dir;
+        if (to < 0 || to >= (int)c.sets.size()) return;
+        std::swap(c.sets[idx], c.sets[to]);
+        if (g_editSet == idx) g_editSet = to;
+        else if (g_editSet == to) g_editSet = idx;
+        if (to == 0) ImGui::SetScrollY(0.0f);                                 // 挪到两端直接贴边
+        else if (to + 1 == (int)c.sets.size()) ImGui::SetScrollY(ImGui::GetScrollMaxY());
+        m.reqSave = true;
+    } else if (g_moveKind == kMoveFood) {
+        std::vector<int> ids = c.FoodIds();
+        int idx = -1;
+        for (int i = 0; i < (int)ids.size(); ++i) if (ids[i] == g_moveId) { idx = i; break; }
+        if (idx < 0) return;
+        const int to = idx + dir;
+        if (to < 0 || to >= (int)ids.size()) return;
+        std::swap(ids[idx], ids[to]);
+        c.foodOrder = ids;
+        if (to == 0) ImGui::SetScrollY(0.0f);
+        else if (to + 1 == (int)ids.size()) ImGui::SetScrollY(ImGui::GetScrollMaxY());
+        m.reqSave = true;
+    }
+}
+
+std::string SetSummary(const LoadoutSet& s, const Config& c)
 {
     std::string r;
     auto add = [&](const std::string& t) { if (!r.empty()) r += " · "; r += t; };
     if (!s.equip.empty()) add(std::string(i18n::Tr("装备 ", "Equip ", "装備 ")) + s.equip);
     if (!s.item.empty()) add(std::string(i18n::Tr("道具 ", "Items ", "アイテム ")) + s.item);
-    if (s.food) add(i18n::Fmt(i18n::Tr("猫饭 %d", "Meal %d", "猫飯 %d"), s.food));
+    if (!s.food) {} else add(FoodLabel(c, s.food));
     return r.empty() ? i18n::Tr("空套装", "empty set", "空のセット") : r;
 }
 
@@ -476,7 +608,7 @@ std::string HotkeyText(const std::string& spec)
 // ---------------------------------------------------------------------------
 int ActiveSetIndex(const Config& c)
 {
-    for (int i = 0; i < (int)c.sets.size(); ++i) if (c.sets[i].name == c.activeSet) return i;
+    for (int i = 0; i < (int)c.sets.size(); ++i) if (c.sets[i].id == c.activeSet) return i;
     return -1;
 }
 
@@ -498,7 +630,7 @@ void PageHome(Model& m)
     if (set) add(i18n::Fmt(i18n::Tr("套装「%s」", "set \"%s\"", "セット「%s」"), set->name.c_str()));
     if (set && !set->item.empty()) add(i18n::Fmt(i18n::Tr("道具「%s」", "items \"%s\"", "アイテム「%s」"), set->item.c_str()));
     const int food = (set && set->food) ? set->food : c.food;
-    if (food) add(i18n::Fmt(i18n::Tr("猫饭 %d", "meal %d", "猫飯 %d"), food));
+    if (food) add(FoodLabel(c, food));
     if (!sub.empty()) Text(fReg, szSmall, kMuted, sub.c_str(), true);
     ImGui::Dummy(ImVec2(0, 24 * S));
 
@@ -671,38 +803,124 @@ bool DeleteButton(const std::string& what)
     return yes;
 }
 
-// 套装列表：点某一套进编辑页，在那里按「确认」就用这套
+// 移动模式下的自动滚动：项挪到「下一行会被挡住」时才滚一格。
+// 边界用这一帧实际被裁到哪（内容区高度可能比面板真正能看见的部分大，拿内容区当边界
+// 会永远判成界外，往下就一路滚到底）；每次只滚一行，上下对称，来回挪能精确回到原位。
+void ScrollMovingIntoView(float rowTop, float rowH)
+{
+    const ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 clipMin = dl->GetClipRectMin();
+    const ImVec2 clipMax = dl->GetClipRectMax();
+    const float rowBottom = rowTop + rowH;
+    const float pad = 4.0f;   // 贴着边界（差 0~3 px）也算要滚，否则收尾会差半格
+    if (rowBottom > clipMax.y - pad) ImGui::SetScrollY(ImGui::GetScrollY() + rowH);
+    else if (rowTop < clipMin.y + pad) ImGui::SetScrollY(ImGui::GetScrollY() - rowH);
+    g_listScroll = ImGui::GetScrollY();   // 给回归测试读
+}
+
 void PageSets(Model& m)
 {
     Config& c = *m.cfg;
     const int activeIdx = ActiveSetIndex(c);
     const std::string sub = activeIdx >= 0
         ? i18n::Fmt(i18n::Tr("重开时套用「%s」", "applied on restart: \"%s\"", "再開時に適用「%s」"),
-                    c.activeSet.c_str())
+                    c.sets[activeIdx].name.c_str())
         : std::string();
     PageHeader(i18n::Tr("套装", "Loadouts", "装備セット"), activeIdx >= 0 ? sub.c_str() : nullptr, false);
+    // 左摇杆按下：把选中的这一套放进移动模式，上下键换位置，再按一次放下
+    const bool moving = g_moveKind == kMoveSet && c.FindSetById(g_moveId) != nullptr;
+    if (!moving && g_moveKind == kMoveSet) { g_moveKind = kMoveNone; g_moveId = 0; }
+    if (moving) {
+        // repeat = true：按住不放也要一直换位置（否则只有第一下有效），
+        // 之前这里写 false，长按就变成了「Focus 在列表里上下走」
+        const bool up = ImGui::IsKeyPressed(ImGuiKey_GamepadDpadUp, true) || ImGui::IsKeyPressed(ImGuiKey_UpArrow, true);
+        const bool down = ImGui::IsKeyPressed(ImGuiKey_GamepadDpadDown, true) || ImGui::IsKeyPressed(ImGuiKey_DownArrow, true);
+        if (up || down) MoveItem(m, up ? -1 : 1);
+        const bool put = ImGui::IsKeyPressed(ImGuiKey_GamepadL3, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false) ||
+                        ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_Space, false) ||
+                        ImGui::IsKeyPressed(ImGuiKey_E, false);
+        const bool cancel = ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+        if (put || cancel) {
+            g_moveKind = kMoveNone;
+            g_focusId = g_moveId;
+            ImGui::SetNavCursorVisible(true);
+        }
+    }
+    // 移动中列表项不参与十字键导航：否则上下键一边换位置一边把 Focus 挪到邻行
+    if (moving) ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
     for (int i = 0; i < (int)c.sets.size(); ++i) {
         ImGui::PushID(i);
-        if (Row("set", c.sets[i].name.c_str(), SetSummary(c.sets[i]).c_str(), i == activeIdx, 54 * S)) {
-            g_editSet = i;
-            Go(kSetEdit);
+        const std::string rowId = "set" + std::to_string(c.sets[i].id);
+        const bool isMoving = moving && g_moveId == c.sets[i].id;
+        const float rowTop = ImGui::GetCursorScreenPos().y;   // 行被完全裁掉时 GetItemRect 不可靠，先记下行的顶
+        const bool acted = Row(rowId.c_str(), c.sets[i].name.c_str(),
+                               isMoving ? "" : SetSummary(c.sets[i], c).c_str(), i == activeIdx, 54 * S, isMoving);
+        const ImGuiID rid = ImGui::GetItemID();   // 这一行的 ID：放下后把焦点还回来要用
+        if (ImGui::IsItemClicked()) g_mouseDownRow = rowId;
+        if (isMoving) {
+            // 正在移动的那一项：整行淡金底 + 金边，右边写「移动中」
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+            dl->AddRectFilled(a, b, IM_COL32(226, 194, 122, 30), 12 * S);
+            dl->AddRect(a - ImVec2(2, 2) * S, b + ImVec2(2, 2) * S, kGold, 12 * S, 0, 2.0f * S);
+            const char* tagTxt = i18n::Tr("移动中", "moving", "移動中");
+            const ImVec2 ts = TextSize(fReg, szSmall, tagTxt);
+            dl->AddText(fReg, szSmall, ImVec2(b.x - 14 * S - ts.x, std::floor(a.y + (b.y - a.y - ts.y) * 0.5f)), kGold, tagTxt);
         }
-        if (i == (activeIdx >= 0 ? activeIdx : 0)) FocusDefault();
+        if (!moving && acted) {
+            g_mouseDownRow.clear();
+            if (i != activeIdx) {
+                c.activeSet = c.sets[i].id;   // 没选中的（鼠标点 / 键盘空格 / 手柄 A）：直接选中
+                m.reqSave = true;
+            } else {
+                g_editSet = i;                // 已经在用的那一套再按一下：进编辑页
+                Go(kSetEdit);
+            }
+        }
+        // 选中一项后按 X（手柄）或 F（键盘）改名
+        if (!moving && ImGui::IsItemFocused() &&
+            (ImGui::IsKeyPressed(ImGuiKey_F, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false)))
+            OpenRename(m, kRenameSet, i);
+        // 按 Y：直接套用这一套（已经在用的就不用再按了）
+        if (!moving && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceUp, false) && i != activeIdx) {
+            c.activeSet = c.sets[i].id;
+            m.reqSave = true;
+        }
+        // 按左摇杆：进入移动模式（哪一项被选中就移动哪一项）
+        if (!moving && ImGui::IsItemFocused() &&
+            (ImGui::IsKeyPressed(ImGuiKey_GamepadL3, false) || ImGui::IsKeyPressed(ImGuiKey_E, false))) {
+            Log("ui: 套装进入移动模式 id=%d", c.sets[i].id);
+            g_moveKind = kMoveSet;
+            g_moveId = c.sets[i].id;
+        }
+        if (!moving && i == (activeIdx >= 0 ? activeIdx : 0)) FocusDefault();
+        if (isMoving) ScrollMovingIntoView(rowTop, 54 * S);
+        if (!moving && g_focusId == c.sets[i].id) {
+            g_focusId = 0;
+            ImGui::SetFocusID(rid, ImGui::GetCurrentWindow());
+            ImGui::SetNavCursorVisible(true);
+        }
         ImGui::PopID();
     }
+    if (moving) ImGui::PopItemFlag();
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) g_mouseDownRow.clear();
     ImGui::Dummy(ImVec2(0, 8 * S));
     const bool newSet = PillButton("##newset", i18n::Tr("新建套装", "New loadout", "新規セット"), ImGui::GetContentRegionAvail().x, 46 * S, kSecondary, kIcPlus);
     if (c.sets.empty()) FocusDefault();
+    ImGui::Dummy(ImVec2(0, 2 * S));
+    Text(fReg, szSmall, kMuted,
+         i18n::Tr("按 A / 空格 选中（再按一次进编辑）· 按 Y 直接套用 · 按 F 或 X 改名 · 按 L3 移动顺序",
+                  "A or Space selects (press again to edit) · Y applies it · F or X renames · L3 reorders",
+                  "A / スペースで選択（もう一度で編集）· Y で適用 · F / X で名前変更 · L3 で並べ替え"));
     if (newSet) {
-        int n = (int)c.sets.size() + 1;
-        std::string name;
-        do { name = std::string(i18n::Tr("套装", "Loadout", "セット")) + std::to_string(n++); } while (c.FindSet(name));
         LoadoutSet s;
-        s.name = name;
+        s.id = c.NextSetId();
+        s.name = std::string(i18n::Tr("套装", "Loadout", "セット")) + std::to_string((int)c.sets.size() + 1);
         c.sets.push_back(s);
         g_editSet = (int)c.sets.size() - 1;
         m.reqSave = true;
-        Go(kSetEdit);
+        g_afterRename = 1;                 // 起完名（或取消）直接进编辑页
+        OpenRenameCreate(m, kRenameSet, g_editSet);
     }
 }
 
@@ -711,7 +929,7 @@ void PageSetEdit(Model& m)
     Config& c = *m.cfg;
     if (g_editSet < 0 || g_editSet >= (int)c.sets.size()) { Go(kSets); return; }
     LoadoutSet& s = c.sets[g_editSet];
-    const bool active = s.name == c.activeSet;
+    const bool active = s.id == c.activeSet;
     PageHeader(s.name.c_str(), active ? i18n::Tr("重开时会套用这套", "applied on restart", "再開時に適用されます") : nullptr, true);
 
     // 装备
@@ -743,13 +961,13 @@ void PageSetEdit(Model& m)
     std::vector<std::string> foods = {kNone};
     std::vector<int> foodIds = {0};
     int curF = 0;
-    for (const auto& f : c.foods) {
-        foods.push_back(i18n::Fmt(i18n::Tr("猫饭 %d", "Meal %d", "猫飯 %d"), f.first));
-        foodIds.push_back(f.first);
-        if (f.first == s.food) curF = (int)foods.size() - 1;
+    for (int fid : c.FoodIds()) {
+        foods.push_back(FoodLabel(c, fid));
+        foodIds.push_back(fid);
+        if (fid == s.food) curF = (int)foods.size() - 1;
     }
-    if (ValueRow("##fd", i18n::Tr("猫饭", "Meal", "猫飯"),
-                 s.food ? i18n::Fmt(i18n::Tr("猫饭 %d", "Meal %d", "猫飯 %d"), s.food).c_str() : kNone)) ImGui::OpenPopup("pick_fd");
+    const std::string foodText = s.food ? FoodLabel(c, s.food) : kNone;
+    if (ValueRow("##fd", i18n::Tr("猫饭", "Meal", "猫飯"), foodText.c_str())) ImGui::OpenPopup("pick_fd");
     p = PickPopup("pick_fd", foods, curF);
     if (p >= 0) { s.food = foodIds[p]; m.reqSave = true; }
 
@@ -762,13 +980,13 @@ void PageSetEdit(Model& m)
     // 确认 = 重开时套用这套（改的内容是随改随存的，不用确认）
     ImGui::Dummy(ImVec2(0, 14 * S));
     if (PillButton("##ok", i18n::Tr("确认", "OK", "決定"), ImGui::GetContentRegionAvail().x, 54 * S, kPrimary)) {
-        c.activeSet = s.name;
+        c.activeSet = s.id;
         m.reqSave = true;
         Go(kSets);
     }
     ImGui::Dummy(ImVec2(0, 4 * S));
     if (DeleteButton(s.name)) {
-        if (active) c.activeSet.clear();
+        if (active) c.activeSet = 0;
         c.sets.erase(c.sets.begin() + g_editSet);
         g_editSet = -1;
         m.reqSave = true;
@@ -776,35 +994,119 @@ void PageSetEdit(Model& m)
     }
 }
 
-// 猫饭列表：点某一份进编辑页，在那里按「确认」就每次进任务都吃它
+// 猫饭列表：没套用套装（或那套没指定猫饭）时，选中 = 每次进任务都吃它；
+// 套装自带猫饭时，重开用的是套装的猫饭，这里只能编辑内容
 void PageFood(Model& m)
 {
     Config& c = *m.cfg;
-    const bool has = c.foods.count(c.food) > 0;
+    // 套装的猫饭会盖掉这里的全局选择（重开时 `if (s.food) g.food = s.food`），
+    // 所以只有没套用套装、或者这套自己没指定猫饭时，「选中」才有意义。
+    const LoadoutSet* act = c.FindSetById(c.activeSet);
+    const int setFood = (act && act->food) ? act->food : 0;
+    const bool locked = setFood != 0;            // 这套自带猫饭：列表只能编辑，不能选
+    const int eff = setFood ? setFood : c.food; // 重开时实际会吃的那一份
+    const bool has = c.foods.count(eff) > 0;
     PageHeader(i18n::Tr("猫饭", "Meals", "猫飯"),
-               has ? i18n::Fmt(i18n::Tr("每次进任务都吃「猫饭 %d」", "eaten on every quest: \"Meal %d\"", "クエストごとに「猫飯 %d」を食べる"), c.food).c_str()
-                   : nullptr,
+               locked ? i18n::Fmt(i18n::Tr("这套套装自带猫饭「%s」", "this loadout brings \"%s\"", "このセットは「%s」を持参"),
+                                  FoodLabel(c, eff).c_str()).c_str()
+                      : has ? i18n::Fmt(i18n::Tr("每次进任务都吃「%s」", "eaten on every quest: \"%s\"", "クエストごとに「%s」を食べる"),
+                                        FoodLabel(c, eff).c_str()).c_str()
+                             : nullptr,
                false);
-    for (auto& kv : c.foods) {
-        ImGui::PushID(kv.first);
-        const std::string name = i18n::Fmt(i18n::Tr("猫饭 %d", "Meal %d", "猫飯 %d"), kv.first);
-        if (Row("food", name.c_str(), FoodSummary(kv.second).c_str(), kv.first == c.food, 54 * S)) {
-            g_editFood = kv.first;
-            Go(kFoodEdit);
+    // 左摇杆按下：把选中的这份猫饭放进移动模式，上下键换位置（只改显示顺序，编号不动）
+    const std::vector<int> ids = c.FoodIds();
+    const bool moving = g_moveKind == kMoveFood && c.foods.count(g_moveId) > 0;
+    if (!moving && g_moveKind == kMoveFood) { g_moveKind = kMoveNone; g_moveId = 0; }
+    if (moving) {
+        const bool up = ImGui::IsKeyPressed(ImGuiKey_GamepadDpadUp, true) || ImGui::IsKeyPressed(ImGuiKey_UpArrow, true);
+        const bool down = ImGui::IsKeyPressed(ImGuiKey_GamepadDpadDown, true) || ImGui::IsKeyPressed(ImGuiKey_DownArrow, true);
+        if (up || down) MoveItem(m, up ? -1 : 1);
+        const bool put = ImGui::IsKeyPressed(ImGuiKey_GamepadL3, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false) ||
+                        ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_Space, false) ||
+                        ImGui::IsKeyPressed(ImGuiKey_E, false);
+        const bool cancel = ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+        if (put || cancel) {
+            g_moveKind = kMoveNone;
+            g_focusId = g_moveId;
+            ImGui::SetNavCursorVisible(true);
         }
-        if (has ? kv.first == c.food : kv.first == c.foods.begin()->first) FocusDefault();
+    }
+    if (moving) ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+    for (int fid : ids) {
+        FoodPreset& f = c.foods[fid];
+        ImGui::PushID(fid);
+        const std::string name = FoodLabel(c, fid);
+        const std::string rowId = "food" + std::to_string(fid);
+        const bool isMoving = moving && g_moveId == fid;
+        const float rowTop = ImGui::GetCursorScreenPos().y;   // 行被完全裁掉时 GetItemRect 不可靠，先记下行的顶
+        const bool acted = Row(rowId.c_str(), name.c_str(), isMoving ? "" : FoodSummary(f).c_str(), fid == eff, 54 * S, isMoving);
+        const ImGuiID rid = ImGui::GetItemID();
+        if (ImGui::IsItemClicked()) g_mouseDownRow = rowId;
+        if (isMoving) {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+            dl->AddRectFilled(a, b, IM_COL32(226, 194, 122, 30), 12 * S);
+            dl->AddRect(a - ImVec2(2, 2) * S, b + ImVec2(2, 2) * S, kGold, 12 * S, 0, 2.0f * S);
+            const char* tagTxt = i18n::Tr("移动中", "moving", "移動中");
+            const ImVec2 ts = TextSize(fReg, szSmall, tagTxt);
+            dl->AddText(fReg, szSmall, ImVec2(b.x - 14 * S - ts.x, std::floor(a.y + (b.y - a.y - ts.y) * 0.5f)), kGold, tagTxt);
+        }
+        if (!moving && acted) {
+            g_mouseDownRow.clear();
+            if (locked || fid == eff) {
+                g_editFood = fid;            // 选中的再按一下进编辑；锁定时所有行都只能编辑
+                Go(kFoodEdit);
+            } else {
+                c.food = fid;                // 没选中的（鼠标 / 空格 / A）：直接选它
+                m.reqSave = true;
+            }
+        }
+        if (!moving && ImGui::IsItemFocused() &&
+            (ImGui::IsKeyPressed(ImGuiKey_F, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false)))
+            OpenRename(m, kRenameFood, fid);
+        // 按 Y：直接选这份猫饭
+        if (!moving && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceUp, false) && !locked && fid != eff) {
+            c.food = fid;
+            m.reqSave = true;
+        }
+        // 按左摇杆：进入移动模式
+        if (!moving && ImGui::IsItemFocused() &&
+            (ImGui::IsKeyPressed(ImGuiKey_GamepadL3, false) || ImGui::IsKeyPressed(ImGuiKey_E, false))) {
+            Log("ui: 猫饭进入移动模式 id=%d", fid);
+            g_moveKind = kMoveFood;
+            g_moveId = fid;
+        }
+        if (!moving && (has ? fid == eff : ids.empty() == false && fid == ids.front())) FocusDefault();
+        if (isMoving) ScrollMovingIntoView(rowTop, 54 * S);
+        if (!moving && g_focusId == fid) {
+            g_focusId = 0;
+            ImGui::SetFocusID(rid, ImGui::GetCurrentWindow());
+            ImGui::SetNavCursorVisible(true);
+        }
         ImGui::PopID();
     }
+    if (moving) ImGui::PopItemFlag();
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) g_mouseDownRow.clear();
     ImGui::Dummy(ImVec2(0, 8 * S));
     const bool newFood = PillButton("##newfood", i18n::Tr("新建猫饭", "New meal", "新規猫飯"), ImGui::GetContentRegionAvail().x, 46 * S, kSecondary, kIcPlus);
     if (c.foods.empty()) FocusDefault();
+    ImGui::Dummy(ImVec2(0, 2 * S));
+    Text(fReg, szSmall, kMuted,
+         locked ? i18n::Tr("这套自带猫饭，这里的行只能编辑，不能选 · 按 F 或 X 改名 · 按 L3 移动顺序",
+                           "this loadout brings its own meal, so rows are edit-only · F or X renames · L3 reorders",
+                           "このセットは猫飯を持参するため、行は編集のみ · F / X で名前変更 · L3 で並べ替え")
+                : i18n::Tr("按 A / 空格 选中（再按一次进编辑）· 按 Y 直接选中 · 按 F 或 X 改名 · 按 L3 移动顺序",
+                           "A or Space selects (press again to edit) · Y selects it · F or X renames · L3 reorders",
+                           "A / スペースで選択（もう一度で編集）· Y で選択 · F / X で名前変更 · L3 で並べ替え"));
     if (newFood) {
         int n = 1;
         while (c.foods.count(n)) ++n;
         c.foods[n] = FoodPreset();
+        c.foodOrder.push_back(n);
         g_editFood = n;
         m.reqSave = true;
-        Go(kFoodEdit);
+        g_afterRename = 2;
+        OpenRenameCreate(m, kRenameFood, n);
     }
 }
 
@@ -815,7 +1117,7 @@ void PageFoodEdit(Model& m)
     if (it == c.foods.end()) { Go(kFood); return; }
     FoodPreset& f = it->second;
     const bool active = c.food == g_editFood;
-    const std::string title = i18n::Fmt(i18n::Tr("猫饭 %d", "Meal %d", "猫飯 %d"), g_editFood);
+    const std::string title = FoodLabel(c, g_editFood);
     PageHeader(title.c_str(), active ? i18n::Tr("每次进任务都吃这个", "eaten on every quest", "クエストごとにこれを食べる") : nullptr, true);
 
     static const char* hp[] = {"+0", "+10", "+20", "+30", "+40", "+50"};
@@ -855,6 +1157,7 @@ void PageFoodEdit(Model& m)
         if (active) c.food = 0;
         for (auto& s : c.sets) if (s.food == g_editFood) s.food = 0;
         c.foods.erase(it);
+        c.NormalizeFoodOrder();
         m.reqSave = true;
         Go(kFood);
     }
@@ -1251,6 +1554,142 @@ void PickPopup(Model& m)
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+//  改名：X（手柄）/ F（键盘）弹出输入框，确定后写回配置（套装名字就是 ini 的段名）
+// ---------------------------------------------------------------------------
+void RenamePopup(Model& m)
+{
+    if (g_renameKind == kRenameNone) {
+        g_renameOpen = false;
+        return;
+    }
+    Config& c = *m.cfg;
+    static const char* kId = "###rename";
+    if (!g_renameOpen) {
+        ImGui::OpenPopup(kId);
+        g_renameOpen = true;
+    } else if (!ImGui::IsPopupOpen(kId)) {
+        g_renameKind = kRenameNone;
+        g_renameOpen = false;
+        g_renameErr.clear();
+        g_renameCreate = false;
+        const int after = g_afterRename;
+        g_afterRename = 0;
+        if (after == 1) Go(kSetEdit);
+        else if (after == 2) Go(kFoodEdit);
+        return;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(460 * S, 0), ImGuiCond_Appearing);
+    const ImVec4 cardBg = V(IM_COL32(30, 26, 21, 250));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, cardBg);
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, cardBg);
+    ImGui::PushStyleColor(ImGuiCol_Border, V(IM_COL32(201, 164, 92, 90)));
+    ImGui::PushStyleColor(ImGuiCol_Text, V(kText));
+    ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0, 0, 0, 0.45f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 18 * S);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 18 * S);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(22 * S, 18 * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+    if (!ImGui::BeginPopupModal(kId, nullptr,
+                                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings |
+                                    ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::PopStyleVar(4);
+        ImGui::PopStyleColor(5);
+        return;
+    }
+
+    auto close = [&]() {
+        g_renameKind = kRenameNone;
+        g_renameOpen = false;
+        g_renameErr.clear();
+        g_renameCreate = false;
+        const int after = g_afterRename;
+        g_afterRename = 0;
+        ImGui::CloseCurrentPopup();
+        if (after == 1) Go(kSetEdit);        // 新建那套 / 那份猫饭，起完名直接进编辑页
+        else if (after == 2) Go(kFoodEdit);
+    };
+
+    if (g_renameCloseReq) {
+        g_renameCloseReq = false;
+        close();
+        ImGui::EndPopup();
+        ImGui::PopStyleVar(4);
+        ImGui::PopStyleColor(5);
+        return;
+    }
+
+    const bool isSet = g_renameKind == kRenameSet;
+    const char* title = g_renameCreate
+        ? (isSet ? i18n::Tr("新建套装", "New loadout", "新規セット")
+                 : i18n::Tr("新建猫饭", "New meal", "新規猫飯"))
+        : (isSet ? i18n::Tr("重命名套装", "Rename loadout", "セット名を変更")
+                 : i18n::Tr("重命名猫饭", "Rename meal", "猫飯名を変更"));
+    Text(fReg, szBody, kTitle, title);
+    ImGui::Dummy(ImVec2(0, 6 * S));
+    if (g_renameFocus) {
+        ImGui::SetKeyboardFocusHere();
+        g_renameFocus = false;
+    }
+    // 名字长的时候输入框跟着变宽（到上限为止），不挤在一个固定宽度里
+    float want = ImGui::CalcTextSize(g_renameBuf).x + 120 * S;
+    if (want < 420 * S) want = 420 * S;
+    if (want > 760 * S) want = 760 * S;
+    ImGui::SetNextItemWidth(want);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, V(IM_COL32(48, 42, 34, 255)));
+    ImGui::PushStyleColor(ImGuiCol_Text, V(kText));
+    std::string hint;
+    if (g_renameCreate) {
+        hint = isSet ? c.sets[g_renameId].name
+                     : i18n::Fmt(i18n::Tr("猫饭 %d", "Meal %d", "猫飯 %d"), g_renameId);
+    }
+    const bool enter = ImGui::InputTextWithHint("##name", hint.c_str(), g_renameBuf, sizeof(g_renameBuf),
+                                                ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::PopStyleColor(2);
+    CutChars(g_renameBuf, kMaxNameChars);   // 粘一大段进来也只留前 50 个字
+    // 输入框外面右下角：还能输几个字
+    const int used = CountChars(g_renameBuf);
+    const std::string cnt = i18n::Fmt("%d/%d", used, kMaxNameChars);
+    const float cw = ImGui::CalcTextSize(cnt.c_str()).x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - cw);
+    Text(fReg, szSmall, used >= kMaxNameChars ? IM_COL32(214, 122, 92, 255) : kMuted, cnt.c_str());
+    ImGui::Dummy(ImVec2(0, 2 * S));
+    if (!g_renameErr.empty()) Text(fReg, szSmall, IM_COL32(214, 122, 92, 255), g_renameErr.c_str());
+    ImGui::Dummy(ImVec2(0, 8 * S));
+
+    bool ok = enter || PillButton("##rnok", i18n::Tr("确定", "OK", "決定"), 150 * S, 44 * S, kPrimary);
+    ImGui::SameLine(0, 10 * S);
+    if (PillButton("##rncancel", i18n::Tr("取消", "Cancel", "キャンセル"), 150 * S, 44 * S, kSecondary) ||
+        ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        close();
+        ImGui::EndPopup();
+        ImGui::PopStyleVar(4);
+        ImGui::PopStyleColor(5);
+        return;
+    }
+    if (ok) {
+        const std::string name = TrimName(g_renameBuf);
+        if (name.empty() && !g_renameCreate) {
+            g_renameErr = i18n::Tr("名字不能为空", "name cannot be empty", "名前を入れてください");
+        } else if (isSet) {
+            // 名字只是显示用的，重名没关系；套用靠的是编号。新建时留空 = 用默认名
+            if (!name.empty()) c.sets[g_renameId].name = name;
+            m.reqSave = true;
+            close();
+        } else {
+            auto it = c.foods.find(g_renameId);
+            if (it != c.foods.end() && !name.empty()) it->second.name = name;
+            m.reqSave = true;
+            close();
+        }
+    }
+    ImGui::EndPopup();
+    ImGui::PopStyleVar(4);
+    ImGui::PopStyleColor(5);
+}
+
 void PageSettings(Model& m)
 {
     Config& c = *m.cfg;
@@ -1341,6 +1780,31 @@ void PageSettings(Model& m)
          true);
     ImGui::Dummy(ImVec2(0, 14 * S));
 
+    Text(fReg, szSmall, kFaint, i18n::Tr("存档位", "Save slot", "セーブスロット"));
+    ImGui::Dummy(ImVec2(0, 2 * S));
+    {
+        const int slots[3] = {1, 2, 3};
+        const float gap = 10 * S;
+        const float bw = (ImGui::GetContentRegionAvail().x - gap * 2) / 3;
+        for (int i = 0; i < 3; ++i) {
+            if (i) ImGui::SameLine(0, gap);
+            const std::string id = "##slot" + std::to_string(slots[i]);
+            const std::string label = std::to_string(slots[i]);
+            const bool on = m.slot == slots[i];
+            if (PillButton(id.c_str(), label.c_str(), bw, 44 * S, on ? kPrimary : kSecondary) && !on) {
+                m.slot = slots[i];
+                m.reqSlot = true;
+            }
+        }
+    }
+    ImGui::Dummy(ImVec2(0, 2 * S));
+    Text(fReg, szSmall, kFaint,
+         i18n::Tr("游戏里换存档之后来这里切一下；套装和猫饭按存档分开存",
+                  "switch here after changing the save slot in game; loadouts are per slot",
+                  "ゲームでスロットを変えたらここで切り替え。セットはスロットごとに保存されます"),
+         true);
+    ImGui::Dummy(ImVec2(0, 14 * S));
+
     Text(fReg, szSmall, kFaint,
          i18n::Tr("从原版 IN-Q 导入", "Import from the original IN-Q", "旧 IN-Q から取り込む"));
     ImGui::Dummy(ImVec2(0, 2 * S));
@@ -1353,6 +1817,8 @@ void PageSettings(Model& m)
                   "pick the config.txt inside the original IN-Q folder; its loadouts are copied over",
                   "旧 IN-Q フォルダの config.txt を選ぶと、セットをまとめて取り込みます"),
          true);
+    ImGui::Dummy(ImVec2(0, 14 * S));
+
     ImGui::Dummy(ImVec2(0, 14 * S));
 
     Text(fReg, szSmall, kFaint, ("Better-IN-Q " + m.version).c_str());
@@ -1521,6 +1987,11 @@ void DebugGo(int page, int editIndex)
     Go(map[page]);
 }
 
+float DebugListScroll()
+{
+    return g_listScroll;
+}
+
 int DebugPage()
 {
     static const Page map[] = {kHome, kQuests, kSets, kSetEdit, kFood, kFoodEdit, kSettings};
@@ -1548,6 +2019,38 @@ std::string DebugCaptureWhy() { return g_capWhy; }
 void DebugSetSearch(const char* text) { std::snprintf(g_search, sizeof(g_search), "%s", text); }
 void DebugOpenPick() { OpenPick(); }
 void DebugClosePick() { g_pickOpen = false; }
+void DebugOpenRename() { g_debugRename = true; }
+void DebugCloseRename() { g_renameCloseReq = true; }
+
+std::string DebugClampName(const char* utf8)
+{
+    char tmp[256];
+    std::snprintf(tmp, sizeof(tmp), "%s", utf8 ? utf8 : "");
+    CutChars(tmp, kMaxNameChars);
+    return std::string(tmp);
+}
+
+void DebugMove(int kind, int id)
+{
+    g_moveKind = kind == 1 ? kMoveSet : (kind == 2 ? kMoveFood : kMoveNone);
+    g_moveId = id;
+}
+
+bool DebugMoveActive() { return g_moveKind != kMoveNone; }
+int DebugMoveId() { return g_moveId; }
+
+void DebugNewSet(Model& m)
+{
+    Config& c = *m.cfg;
+    LoadoutSet s;
+    s.id = c.NextSetId();
+    s.name = i18n::Fmt(i18n::Tr("套装 %d", "Loadout %d", "セット %d"), s.id);
+    c.sets.push_back(s);
+    g_editSet = (int)c.sets.size() - 1;
+    g_afterRename = 1;
+    OpenRenameCreate(m, kRenameSet, g_editSet);
+    m.reqSave = true;
+}
 
 void OnOpen(Model& m)
 {
@@ -1617,7 +2120,7 @@ void Draw(Model& m, float screenW, float screenH)
     const bool capturing = g_cap.spec != nullptr;
     UpdateCapture(m);
     const ImGuiConfigFlags navFlags = ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard;
-    if (g_cap.spec) ImGui::GetIO().ConfigFlags &= ~navFlags;
+    if (g_cap.spec || g_moveKind != kMoveNone) ImGui::GetIO().ConfigFlags &= ~navFlags;
     else ImGui::GetIO().ConfigFlags |= navFlags;
 
     // B / Esc 返回（主页上就是关面板）。弹窗、输入框、录快捷键时不算。
@@ -1625,14 +2128,18 @@ void Draw(Model& m, float screenW, float screenH)
     // 不然同一下 B 又会被当成「返回上一页」
     const bool popup = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) || g_popupLastFrame;
     const bool typing = ImGui::GetIO().WantTextInput;
-    if (!popup && !typing && !capturing &&
+    // 移动模式里 B / Esc 是「放下」，由列表页自己吃掉，这里不能再当成「返回上一页」
+    if (!popup && !typing && !capturing && g_moveKind == kMoveNone &&
         (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))) {
         if (Back(g_page) != g_page) Go(Back(g_page));
         else if (g_page != kHome) Go(kHome);
         else m.reqClose = true;
     }
 
+    const bool movingNow = g_moveKind != kMoveNone;
+    if (movingNow) ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
     const bool sideNav = Sidebar(0, 0, sideW, H);
+    if (movingNow) ImGui::PopItemFlag();
 
     // 焦点在侧栏时，内容区不参与十字键导航：上下只在侧栏里走，不会被右边离得近的一行抢走；
     // 回内容区由侧栏自己处理（按右 / 按 A 落到这一页的默认项）
@@ -1657,6 +2164,11 @@ void Draw(Model& m, float screenW, float screenH)
     // 默认项这一帧没画出来（比如被搜索过滤掉了）就作废，免得之后抢焦点。
     // 但这一帧中途换了页的话，请求是给新页的，留到下一帧
     if (!g_focusUsed && g_page == drawn) g_focus = 0;
+    if (g_debugRename) {
+        g_debugRename = false;
+        if (g_page == kSets && !m.cfg->sets.empty()) OpenRename(m, kRenameSet, 0);
+        else if (g_page == kFood && !m.cfg->foods.empty()) OpenRename(m, kRenameFood, m.cfg->foods.begin()->first);
+    }
     g_contentH[drawn] = ImGui::GetCursorPosY() + inPad.y;   // 这一页内容实际多高，下一帧按它收紧面板
     ImGui::EndChild();
     if (sideNav) ImGui::PopItemFlag();
@@ -1664,7 +2176,7 @@ void Draw(Model& m, float screenW, float screenH)
     // 十字键往左、内容区里左边已经没有能去的控件：直接去侧栏当前页那一格。
     // 这一帧所有控件都已经参与过打分，结果是空的就取消这次移动，换成我们指定的落点。
     ImGuiContext& g = *GImGui;
-    if (!sideNav && !popup && g_sideCurId && g.NavMoveSubmitted && g.NavMoveScoringItems && g.NavMoveDir == ImGuiDir_Left &&
+    if (!sideNav && !movingNow && !popup && g_sideCurId && g.NavMoveSubmitted && g.NavMoveScoringItems && g.NavMoveDir == ImGuiDir_Left &&
         !g.NavMoveResultLocal.ID && !g.NavMoveResultLocalVisible.ID && !g.NavMoveResultOther.ID) {
         ImGui::NavMoveRequestCancel();
         ImGui::SetFocusID(g_sideCurId, ImGui::GetCurrentWindow());
@@ -1689,6 +2201,7 @@ void Draw(Model& m, float screenW, float screenH)
                 }
 
     PickPopup(m);
+    RenamePopup(m);
 }
 
 } // namespace ui

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 # 打发布包（狩技盒子拖进去就能装，也可以直接解压到游戏根目录）。
 #   py -3 tools/make_zip.py [输出目录]
 #
@@ -7,7 +7,7 @@
 # 以后用盒子更新/卸载都不会冲掉玩家改过的设置。
 import hashlib, os, sys, zipfile
 
-VER = 'v0.7'
+VER = 'v0.7.1'
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 OUT_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, 'out')
 ZIP = os.path.join(OUT_DIR, 'Better-IN-Q %s.zip' % VER)

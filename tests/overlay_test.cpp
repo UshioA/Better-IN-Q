@@ -162,6 +162,36 @@ int wmain(int argc, wchar_t** argv)
         if (i == 2) g_shot = out + L"\\overlay_settings.png";
         frame(0.25f, 0.35f, 0.25f);
     }
+    // 看样子用：套装列表里按 X / F 弹出的改名框
+    ui::DebugGo(2, 0);
+    for (int i = 0; i < 6; ++i) frame(0.25f, 0.35f, 0.25f);
+    ui::DebugOpenRename();
+    for (int i = 0; i < 10; ++i) {
+        if (i == 9) g_shot = out + L"\\overlay_rename.png";
+        frame(0.25f, 0.35f, 0.25f);
+    }
+    ui::DebugCloseRename();
+    for (int i = 0; i < 4; ++i) frame(0.25f, 0.35f, 0.25f);
+    // 看样子用：新建套装时就能起名
+    ui::DebugGo(2, 0);
+    for (int i = 0; i < 6; ++i) frame(0.25f, 0.35f, 0.25f);
+    ui::DebugNewSet(g_model);
+    for (int i = 0; i < 10; ++i) {
+        if (i == 9) g_shot = out + L"\\overlay_rename_new.png";
+        frame(0.25f, 0.35f, 0.25f);
+    }
+    ui::DebugCloseRename();
+    for (int i = 0; i < 6; ++i) frame(0.25f, 0.35f, 0.25f);
+    // 看样子用：按左摇杆进入移动模式
+    ui::DebugGo(2, 0);
+    for (int i = 0; i < 6; ++i) frame(0.25f, 0.35f, 0.25f);
+    ui::DebugMove(1, g_cfg.sets.empty() ? 1 : g_cfg.sets[0].id);
+    for (int i = 0; i < 6; ++i) {
+        if (i == 5) g_shot = out + L"\\overlay_move.png";
+        frame(0.25f, 0.35f, 0.25f);
+    }
+    ui::DebugMove(0, 0);
+    for (int i = 0; i < 4; ++i) frame(0.25f, 0.35f, 0.25f);
     // 看样子用：从原版 IN-Q 导入的文件选择框
     ui::DebugOpenPick();
     for (int i = 0; i < 8; ++i) {

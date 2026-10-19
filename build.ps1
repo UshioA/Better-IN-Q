@@ -1,4 +1,4 @@
-﻿﻿﻿﻿# ============================================================================
+﻿﻿﻿# ============================================================================
 #  Better-IN-Q —— 用 MSVC（Visual Studio 2022 / Build Tools 都行）构建，不需要 MinGW。
 #    powershell -ExecutionPolicy Bypass -File build.ps1 [dll|test|all]   默认 all
 #  产物：out\BetterINQ.dll
@@ -43,7 +43,7 @@ $Common = @("/nologo", "/utf-8", "/std:c++17", "/O2", "/EHsc", "/MT", "/W3", "/M
 
 # MinGW 的 ld 会默认带上 user32 之类，MSVC 得一个个写出来
 $WinLibs = @("kernel32.lib", "user32.lib", "gdi32.lib", "shell32.lib", "ole32.lib", "uuid.lib",
-              "dinput8.lib", "dxguid.lib")
+              "dinput8.lib", "dxguid.lib", "advapi32.lib")
 $D3D11   = @("d3d11.lib", "d3dcompiler.lib", "dxgi.lib", "dwmapi.lib", "imm32.lib")
 
 # cl 把错误写到 stderr，而 PowerShell 5.1 在 $ErrorActionPreference = "Stop" 时
@@ -88,7 +88,7 @@ if ($What -eq "dll" -or $What -eq "all") {
     Build-ImGui
     $srcs = @("main", "inq", "hook", "config", "input", "log",
               "ui", "gamedata", "overlay", "padfilter", "cursorfilter", "kbdfilter", "dinfilter",
-              "hdr", "inqimport",
+              "hdr", "inqimport", "profile",
               "i18n") |
             ForEach-Object { Join-Path $Src "$_.cpp" }
     Compile ($Common + @("/LD", "/I$IM", "/Isrc", "/Fe$Out\BetterINQ.dll", "/Fo$Obj\") +
@@ -126,6 +126,10 @@ if ($What -eq "test" -or $What -eq "all") {
         "$Tests\cursor_test.cpp", "$Src\cursorfilter.cpp", "$Src\hook.cpp", "$Src\log.cpp",
         "$Src\i18n.cpp") +
         @("/link") + $WinLibs)
+
+    Compile ($Common + @("/Fo$Obj\", "/Isrc", "/Fe$Out\profile_test.exe",
+                         "$Tests\profile_test.cpp", "$Src\profile.cpp", "$Src\log.cpp", "$Src\i18n.cpp") + @("/link") + $WinLibs)
+    if ($LASTEXITCODE -ne 0) { throw "profile_test 编译失败" }
 
     Compile ($Common + @("/Fo$Obj\", "/Isrc", "/Fe$Out\inqimport_test.exe",
         "$Tests\inqimport_test.cpp", "$Src\inqimport.cpp", "$Src\config.cpp", "$Src\i18n.cpp",
@@ -168,7 +172,7 @@ if ($What -eq "test" -or $What -eq "all") {
         $ImGuiObjs + @("/link") + @("d3d12.lib") + $D3D11 + $WinLibs + @("windowscodecs.lib"))
 
     $fail = 0
-    foreach ($t in @("hook_test", "gamedata_test", "config_test", "cursor_test", "kbdfilter_test", "hdr_test", "inqimport_test",
+    foreach ($t in @("hook_test", "gamedata_test", "config_test", "cursor_test", "kbdfilter_test", "hdr_test", "profile_test", "inqimport_test",
                      "dinfilter_test", "ui_nav_test")) {
         Write-Host "  run $t.exe"
         & (Join-Path $Out "$t.exe")

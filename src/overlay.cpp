@@ -11,8 +11,10 @@
 #include <d3d11.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <imm.h>
 #include <atomic>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 #include <cfloat>
@@ -49,6 +51,12 @@ IDXGISwapChain* g_sc = nullptr;                // 游戏的交换链（只比指
 IDXGISwapChain* g_foreign = nullptr;           // 上一个确认过不是游戏的交换链，免得每帧再查
 HWND g_hwnd = nullptr;
 WNDPROC g_wndProc = nullptr;
+thread_local int g_wndDepth = 0;   // 窗口过程的重入层数，见 WndProc 顶部
+// 崩溃诊断：当前在哪个钩子/阶段（异常处理里会读它）
+std::atomic<const char*> g_stage{"idle"};
+void SetStage(const char* s) { g_stage = s; }
+// 重入计数：我们自己的渲染里再触发 Present/面板渲染会无限套娃（栈溢出）
+thread_local int g_depth = 0;
 void (*g_debugAfterDraw)(void*) = nullptr;
 void (*g_debugAfterDraw12)(void*, void*) = nullptr;
 ImU32 g_lastScaledEvent = 0;
@@ -78,10 +86,178 @@ ID3D12CommandAllocator* g_alloc[kMaxBuffers] = {};
 UINT64 g_allocFence[kMaxBuffers] = {};
 DXGI_FORMAT g_bbFormat = DXGI_FORMAT_UNKNOWN;
 
+// ---- 输入法
+// 游戏窗口本来没有输入法上下文（MHW 没有文字输入），面板要打字就得自己挂一个：
+// 挂上之后 IME 的组字消息才会送进这个窗口，WndProc 再把它们交给 ImGui 后端。
+HIMC g_imc = nullptr;
+HIMC g_imcPrev = nullptr;
+bool g_imeWant = false;
+int g_imeStart = 0, g_imeComp = 0, g_imeResult = 0, g_imeChar = 0, g_imeFix = 0;   // 诊断用
+
+// 输入法上下文（HIMC）属于线程，而且只有窗口自己的线程去挂才有用：
+// MHW 的主线程建窗口，Present 却在渲染线程上，所以这里必须把 IMM 调用
+// 投递到窗口线程去执行，不能顺手在 Present 里干。
+constexpr UINT kImeSync = WM_APP + 0x51;   // 让窗口线程去碰输入法上下文
+constexpr UINT kImePos = WM_APP + 0x52;    // 让窗口线程去摆组字窗/候选窗的位置
+bool g_imeAttached = false;
+std::atomic<bool> g_imeEnabled{true};
+// 游戏窗口已经没了（要退出了）：面板逻辑一律停用，Present 只做转发。
+// 实测窗口销毁时如果面板还开着，我们的 Present 会带着失效的交换链继续画，
+// 游戏的退出流程就再也走不完（画面没了但手柄还能动游戏）。
+std::atomic<bool> g_dead{false};
+unsigned g_imeTick = 0;
+
+void ImeOnWindowThread()
+{
+    if (!g_hwnd) return;
+    if (!g_imeEnabled.load()) return;
+    if (g_imeAttached && !g_imc) {
+        g_imc = ::ImmCreateContext();
+        if (!g_imc) { Log("ime: 建不了输入法上下文"); return; }
+        g_imcPrev = ::ImmAssociateContext(g_hwnd, g_imc);
+        ::ImmSetOpenStatus(g_imc, FALSE);   // 光标进输入框时才打开，平时不挡键盘
+        const DWORD wt = ::GetWindowThreadProcessId(g_hwnd, nullptr);
+        const HKL hkl = ::GetKeyboardLayout(wt);
+        wchar_t file[260] = L"";
+        ::ImmGetIMEFileNameW(hkl, file, 259);
+        Log("ime: 挂上输入法上下文（窗口线程 %lu，当前线程 %lu，布局 %p，是输入法 %d，%ls）",
+            wt, ::GetCurrentThreadId(), (void*)hkl, ::ImmIsIME(hkl) ? 1 : 0, file);
+    }
+    if (!g_imc) return;
+    // 游戏自己也在管 IME（聊天输入），可能把窗口的上下文换掉或摘掉：被换了就挂回来
+    HIMC cur = ::ImmGetContext(g_hwnd);
+    if (cur) ::ImmReleaseContext(g_hwnd, cur);
+    if (cur != g_imc) {
+        ::ImmAssociateContext(g_hwnd, g_imc);
+        if (++g_imeFix <= 3) Log("ime: 上下文被别人换掉了（%p），重新挂回来", (void*)cur);
+    }
+    ::ImmSetOpenStatus(g_imc, g_imeWant ? TRUE : FALSE);
+}
+
+void ImeOffWindowThread()
+{
+    if (!g_imc) return;
+    ::ImmAssociateContext(g_hwnd, g_imcPrev);
+    ::ImmDestroyContext(g_imc);
+    g_imc = nullptr;
+    g_imcPrev = nullptr;
+    g_imeWant = false;
+    Log("ime: 卸掉输入法上下文（消息 START=%d COMPOSITION=%d 结果串=%d CHAR=%d 重挂=%d）",
+        g_imeStart, g_imeComp, g_imeResult, g_imeChar, g_imeFix);
+    g_imeStart = g_imeComp = g_imeResult = g_imeChar = g_imeFix = 0;
+}
+
+// 组字窗和候选窗要摆在输入框底下。ImGui 给的 InputPos 是「后台缓冲」坐标（我们改过
+// io.DisplaySize），输入法要的是窗口客户区坐标；只有 1:1 时才一样，系统缩放 125% 时
+// 缓冲比客户区大，不换算的话这个点会被判成「在窗口外面」，输入法就把窗口丢到屏幕角上。
+void ImeSetPosOnWindowThread(int x, int y)
+{
+    HIMC c = ::ImmGetContext(g_hwnd);
+    if (!c) return;
+    COMPOSITIONFORM cf{};
+    cf.dwStyle = CFS_POINT;
+    cf.ptCurrentPos.x = x;
+    cf.ptCurrentPos.y = y;
+    ::ImmSetCompositionWindow(c, &cf);
+    CANDIDATEFORM cand{};
+    cand.dwIndex = 0;
+    cand.dwStyle = CFS_CANDIDATEPOS;
+    cand.ptCurrentPos.x = x;
+    cand.ptCurrentPos.y = y + 2;
+    ::ImmSetCandidateWindow(c, &cand);
+    ::ImmReleaseContext(g_hwnd, c);
+}
+
+void ImeSetPos(int x, int y)
+{
+    if (!g_hwnd) return;
+    if (::GetWindowThreadProcessId(g_hwnd, nullptr) == ::GetCurrentThreadId()) ImeSetPosOnWindowThread(x, y);
+    else ::PostMessageW(g_hwnd, kImePos, (WPARAM)x, (LPARAM)y);
+}
+
+// 换掉 ImGui 默认的输入法摆位实现：它不知道我们把 DisplaySize 设成了缓冲分辨率
+void SetImeDataFn(ImGuiContext*, ImGuiViewport*, ImGuiPlatformImeData* data)
+{
+    if (!data || !data->WantVisible || !g_hwnd) return;
+    RECT rc{};
+    if (!::GetClientRect(g_hwnd, &rc)) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    const float fx = io.DisplaySize.x > 0 ? (float)(rc.right - rc.left) / io.DisplaySize.x : 1.0f;
+    const float fy = io.DisplaySize.y > 0 ? (float)(rc.bottom - rc.top) / io.DisplaySize.y : 1.0f;
+    ImeSetPos((int)(data->InputPos.x * fx), (int)((data->InputPos.y + data->InputLineHeight) * fy));
+}
+
+void ImeRequest(bool attach, bool want)
+{
+    if (!g_hwnd) return;
+    g_imeAttached = attach;
+    g_imeWant = want;
+    if (::GetWindowThreadProcessId(g_hwnd, nullptr) == ::GetCurrentThreadId()) {
+        if (attach) ImeOnWindowThread();
+        else ImeOffWindowThread();
+        return;
+    }
+    if (!::PostMessageW(g_hwnd, kImeSync, attach ? 1 : 0, want ? 1 : 0))
+        Log("ime: 投递同步消息失败 %lu", ::GetLastError());
+}
+
 // 面板开着时把键鼠消息吃掉，游戏收不到（手柄另由 padfilter 挡）
 LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
 {
+    // 万一窗口过程被装了两层（游戏退出到标题会重建窗口），消息会在我们和
+    // CallWindowProc 之间原地打转，最后栈溢出（0xC00000FD 在 USER32）。
+    // 这里加个数上限，超了就直接交回系统，宁可不画面板也别把游戏带崩。
+    ++g_wndDepth;
+    struct DepthGuard {
+        ~DepthGuard() { --g_wndDepth; }
+    } depthGuard;
+    if (g_wndDepth > 8) return ::DefWindowProcW(h, msg, w, l);
+    if (msg == kImeSync) {
+        if (w) ImeOnWindowThread();
+        else ImeOffWindowThread();
+        return 0;
+    }
+    if (msg == kImePos) {
+        ImeSetPosOnWindowThread((int)w, (int)l);
+        return 0;
+    }
     if (g_open.load()) {
+        // 输入法：自己取结果串塞进 ImGui，不交给后端（后端会再调 DefWindowProcW，
+        // 结果串可能被算两遍，也不保证一定生成 WM_CHAR）
+        switch (msg) {
+        case WM_IME_STARTCOMPOSITION:
+            ++g_imeStart;
+            return ::DefWindowProcW(h, msg, w, l);
+        case WM_IME_COMPOSITION:
+            ++g_imeComp;
+            if (l & GCS_RESULTSTR) {
+                ++g_imeResult;
+                if (HIMC imc = ::ImmGetContext(h)) {
+                    const LONG bytes = ::ImmGetCompositionStringW(imc, GCS_RESULTSTR, nullptr, 0);
+                    if (bytes > 0) {
+                        std::wstring text((size_t)bytes / sizeof(wchar_t), L'\0');
+                        ::ImmGetCompositionStringW(imc, GCS_RESULTSTR, &text[0], bytes);
+                        ImGuiIO& mio = ImGui::GetIO();
+                        for (wchar_t ch : text) mio.AddInputCharacterUTF16((ImWchar16)ch);
+                    }
+                    ::ImmReleaseContext(h, imc);
+                }
+            }
+            return 0;   // 不给游戏，也不让系统再生成一份
+        case WM_IME_CHAR:
+            ++g_imeChar;
+            return 0;
+        case WM_IME_ENDCOMPOSITION:
+        case WM_IME_NOTIFY:
+        case WM_IME_REQUEST:
+        case WM_IME_SELECT:
+        case WM_IME_KEYDOWN:
+        case WM_IME_KEYUP:
+            return ::DefWindowProcW(h, msg, w, l);
+        case WM_IME_SETCONTEXT:
+            // 组字窗和候选窗的位置由 ImGui 的 IME 数据决定，别让系统再画一份
+            return ::DefWindowProcW(h, msg, w, l & ~ISC_SHOWUICOMPOSITIONWINDOW);
+        }
         ImGui_ImplWin32_WndProcHandler(h, msg, w, l);
         switch (msg) {
         case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP: case WM_CHAR:
@@ -93,7 +269,23 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             return ::DefWindowProcW(h, msg, w, l);   // 原始输入：交给系统收尾，不给游戏
         }
     }
+    if (!g_wndProc || g_wndProc == WndProc) return ::DefWindowProcW(h, msg, w, l);
     return ::CallWindowProcW(g_wndProc, h, msg, w, l);
+}
+
+// 记下我们改过的虚表，退出时好还原（诊断用）
+void** g_swapVt = nullptr;
+void** g_swapVt3 = nullptr;
+void** g_queueVt = nullptr;
+
+void UnpatchSlot(void** slot, void* orig)
+{
+    if (!slot || !orig) return;
+    DWORD old = 0;
+    if (!::VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return;
+    *slot = orig;
+    ::VirtualProtect(slot, sizeof(void*), old, &old);
+    ::FlushInstructionCache(::GetCurrentProcess(), slot, sizeof(void*));
 }
 
 bool PatchSlot(void** slot, void* hook, void** orig)
@@ -130,7 +322,10 @@ void WINAPI HkExecute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* l
         if (SUCCEEDED(q->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&d))) && d) {
             if (d == want) {
                 ID3D12CommandQueue* expected = nullptr;
-                if (g_queue.compare_exchange_strong(expected, q)) Log("overlay: 记下游戏的 D3D12 命令队列 %p", (void*)q);
+                if (g_queue.compare_exchange_strong(expected, q)) {
+                    // 不加引用：退出到标题时游戏会放掉队列，我们攥着会让它死不掉   // 游戏退出到标题时会把队列放掉，我们自己得攥着
+                    Log("overlay: 记下游戏的 D3D12 命令队列 %p（不持引用）", (void*)q);
+                }
             }
             d->Release();
         }
@@ -147,6 +342,7 @@ bool HookExecute(ID3D12Device* dev)
     ID3D12CommandQueue* tmp = nullptr;
     if (FAILED(dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&tmp))) || !tmp) return false;
     void** vt = *reinterpret_cast<void***>(tmp);
+    g_queueVt = vt;
     const bool ok = PatchSlot(&vt[10], reinterpret_cast<void*>(HkExecute), reinterpret_cast<void**>(&g_execute));
     tmp->Release();
     Log("overlay: %s ExecuteCommandLists", ok ? "已挂" : "挂不上");
@@ -207,11 +403,13 @@ int InitD3D12Objects(IDXGISwapChain* sc, ID3D12Device* dev)
                                       reinterpret_cast<void**>(&g_list)))) return 0;
     g_list->Close();
     g_dev12 = dev;
+    // 不 AddRef：设备归游戏管，多一个引用会让它在退出到标题时死不掉          // 同上：设备归游戏管，但我们每帧都在用，得自己拿一份引用
     return 1;
 }
 
 void Render12(IDXGISwapChain* sc, ImDrawData* dd)
 {
+    SetStage("render12");
     ID3D12CommandQueue* q = g_queue.load();
     const UINT i = g_sc3->GetCurrentBackBufferIndex();
     if (i >= kMaxBuffers) return;
@@ -255,6 +453,7 @@ void Render12(IDXGISwapChain* sc, ImDrawData* dd)
 // 用不了不算失败：进程里所有交换链共用一张虚表，别人的 Present 也会走到这里。
 int InitRenderer(IDXGISwapChain* sc)
 {
+    SetStage("init");
     if (sc == g_foreign) return 0;
     // 按快捷键时游戏窗口在前台（快捷键只在游戏有焦点时才响应）：别的窗口的交换链（别的模组、工具）不认
     HWND fg = ::GetForegroundWindow();
@@ -324,44 +523,99 @@ int InitRenderer(IDXGISwapChain* sc)
     }
     if (g_cb.init) g_cb.init(h > 0 ? h / 1080.0f : 1.0f);
     hdr::Detect(sc);   // 按交换链的色域决定要不要做 HDR 转换
-    g_wndProc = reinterpret_cast<WNDPROC>(::SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WndProc)));
+    {
+        const LONG_PTR prev = ::GetWindowLongPtrW(g_hwnd, GWLP_WNDPROC);
+        if (prev == reinterpret_cast<LONG_PTR>(WndProc)) {
+            Log("overlay: 窗口过程已经是我们，跳过重复接管");
+        } else {
+            g_wndProc = reinterpret_cast<WNDPROC>(prev);
+            ::SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WndProc));
+            Log("overlay: 接管窗口过程 %p -> %p", (void*)prev, (void*)&WndProc);
+        }
+    }
     g_inited = true;
     Log("overlay: 就绪（%s，窗口 %ldx%ld，缓冲 %ux%u x%u，格式 %d）", g_api == kD3D11 ? "D3D11" : "D3D12",
         rc.right - rc.left, rc.bottom - rc.top, d.BufferDesc.Width, d.BufferDesc.Height, d.BufferCount, (int)d.BufferDesc.Format);
     return 1;
 }
 
-// 这一帧是不是游戏的交换链在 Present。游戏重建交换链（切全屏之类）时指针会变，
-// 同一个窗口、同一个设备的就认作新的游戏交换链。
+// 把「我们自建、绑在这个设备/交换链上」的资源全丢掉，等下次开面板重新建。
+// 游戏退出存档回标题时会换设备（甚至换格式），旧资源再碰就是野指针。
+void DropRenderer()
+{
+    Log("overlay: 丢掉渲染资源（设备要换了）");
+    if (g_api == kD3D11) ImGui_ImplDX11_Shutdown();
+    else if (g_api == kD3D12) ImGui_ImplDX12_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    if (ImGui::GetCurrentContext()) ImGui::DestroyContext();
+    ReleaseRtv();
+    if (g_list) { g_list->Release(); g_list = nullptr; }
+    for (UINT i = 0; i < kMaxBuffers; ++i)
+        if (g_alloc[i]) { g_alloc[i]->Release(); g_alloc[i] = nullptr; }
+    if (g_fence) { g_fence->Release(); g_fence = nullptr; }
+    if (g_sc3) { g_sc3->Release(); g_sc3 = nullptr; }
+    if (g_dev) g_dev = nullptr;
+    g_dev12 = nullptr;
+    g_queue = nullptr;
+    g_wasOpen = false;
+    g_inited = false;
+}
+
+// 这一帧是不是游戏的交换链在 Present。游戏重建交换链（切全屏、退出存档回标题）时
+// 指针会变，甚至设备都换了；同一个窗口就认作新的游戏交换链，旧资源就地丢掉。
 bool IsGameSwapChain(IDXGISwapChain* sc)
 {
     if (sc == g_sc) return true;
     if (sc == g_foreign) return false;
+    Log("overlay: 交换链接管 %p -> %p", (void*)g_sc, (void*)sc);
     DXGI_SWAP_CHAIN_DESC d{};
-    bool same = SUCCEEDED(sc->GetDesc(&d)) && d.OutputWindow == g_hwnd;
-    if (same && g_api == kD3D11) {
+    if (!SUCCEEDED(sc->GetDesc(&d)) || d.OutputWindow != g_hwnd) { g_foreign = sc; return false; }
+
+    if (g_api == kD3D11) {
         ID3D11Device* dev = nullptr;
-        same = SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev))) && dev == g_dev;
+        const bool same = SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev))) && dev == g_dev;
         if (dev) dev->Release();
-    } else if (same) {
+        if (same) { g_sc = sc; ReleaseRtv(); return true; }
+    } else {
         ID3D12Device* dev = nullptr;
         IDXGISwapChain3* sc3 = nullptr;
-        same = SUCCEEDED(sc->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dev))) && dev == g_dev12 &&
-               d.BufferDesc.Format == g_bbFormat &&
-               SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&sc3)));
+        const bool gotDev = SUCCEEDED(sc->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dev))) && dev != nullptr;
+        const bool gotSc3 = SUCCEEDED(sc->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&sc3))) && sc3 != nullptr;
+        if (gotDev && gotSc3) {
+            if (dev == g_dev12 && d.BufferDesc.Format == g_bbFormat) {
+                g_sc3->Release();
+                g_sc3 = sc3;
+                g_sc = sc;
+                ReleaseRtv();
+                return true;
+            }
+            DropRenderer();
+            g_sc = sc;
+            g_sc3 = sc3;
+            g_dev12 = dev;                       // 不持引用
+            g_bbFormat = d.BufferDesc.Format;
+            Log("overlay: 新交换链接管完成（格式 %d，%ux%u）", (int)g_bbFormat, d.BufferDesc.Width, d.BufferDesc.Height);
+            return true;
+        }
         if (dev) dev->Release();
-        if (same) { g_sc3->Release(); g_sc3 = sc3; }
+        if (sc3) sc3->Release();
     }
-    if (!same) { g_foreign = sc; return false; }
-    g_sc = sc;
-    ReleaseRtv();
-    return true;
+    g_foreign = sc;
+    return false;
 }
 
 void RenderPanel(IDXGISwapChain* sc)
 {
+    SetStage("render");
+    if (g_dead.load()) return;
+    if (g_depth > 1) return;                      // 别在渲染里再进渲染
+    struct DepthGuard { DepthGuard() { ++g_depth; } ~DepthGuard() { --g_depth; } } dg;
     const bool open = g_open.load();
-    if (open && !g_wasOpen && g_cb.opened) g_cb.opened();
+    if (open && !g_wasOpen) {
+        if (g_imeEnabled.load()) ImeRequest(true, false);
+        if (g_cb.opened) g_cb.opened();
+    }
+    if (!open && g_wasOpen) ImeRequest(false, false);
     g_wasOpen = open;
     if (!open) return;
     if (g_api == kD3D11 && !g_rtv && !CreateRtv(sc)) return;
@@ -370,6 +624,7 @@ void RenderPanel(IDXGISwapChain* sc)
     else ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGuiIO& io = ImGui::GetIO();
+    ImGui::GetPlatformIO().Platform_SetImeDataFn = SetImeDataFn;   // 每帧设一次：后端初始化时会塞它自己的
     io.MouseDrawCursor = true;   // 游戏把系统光标藏了，面板开着时自己画一个
     // 直接按后台缓冲的真实分辨率排版和渲染。游戏没声明高 DPI，系统缩放 125% 时
     // 它拿到的窗口大小是缩小过的（2560x1440 的屏报成 2048x1152），按那个排版再放大就糊了。
@@ -388,6 +643,19 @@ void RenderPanel(IDXGISwapChain* sc)
         io.DisplayFramebufferScale = ImVec2(1, 1);
     }
     ImGui::NewFrame();
+    // 有输入框拿到焦点时才把输入法打开，免得平时按键被组字吞掉。
+    // 这里只投递，真正的 IMM 调用在窗口线程上做（见 ImeOnWindowThread）。
+    if (g_imeAttached) {
+        const bool want = io.WantTextInput;
+        if (!g_imeEnabled.load()) {
+            // 排查模式：不接管输入法
+        } else if (want != g_imeWant) {
+            Log("ime: %s文字输入", want ? "开始" : "结束");
+            ImeRequest(true, want);
+        } else if (want && (++g_imeTick % 30) == 0) {
+            ImeRequest(true, want);   // 每半秒确认一次，上下文被游戏换掉就挂回来
+        }
+    }
     if (g_cb.draw) g_cb.draw(io.DisplaySize.x, io.DisplaySize.y);
     ImGui::Render();
     hdr::Apply(ImGui::GetDrawData());   // HDR 交换链：把顶点颜色换成目标编码
@@ -449,6 +717,13 @@ void PerfTick(unsigned long long begin, unsigned long long end)
 
 HRESULT WINAPI HkPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
+    SetStage("present");
+    if (g_dead.load()) return g_present(sc, sync, flags);   // 窗口都没了，纯转发
+    if (g_depth > 3) {                            // Present 套娃：只转发，不再走我们的逻辑
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 3) Log("overlay: Present 重入 %d 层，跳过本帧的面板处理", g_depth);
+        return g_present(sc, sync, flags);
+    }
     LARGE_INTEGER q0, q1;
     ::QueryPerformanceCounter(&q0);
     if (!g_failed.load() && !(flags & DXGI_PRESENT_TEST)) {
@@ -463,7 +738,19 @@ HRESULT WINAPI HkPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
                 g_failed = true;
             }
         }
-        if (g_inited && IsGameSwapChain(sc)) RenderPanel(sc);
+        if (g_inited && IsGameSwapChain(sc)) {
+        // 栈用量哨兵：栈溢出前往往已经吃掉大半栈，先记一笔
+        static std::atomic<unsigned long long> nextAt{0};
+        const unsigned long long now = ::GetTickCount64();
+        if (now >= nextAt.load()) {
+            nextAt = now + 30000;
+            char here = 0;
+            PNT_TIB tib = reinterpret_cast<PNT_TIB>(::NtCurrentTeb());
+            const unsigned long long used = static_cast<const char*>(tib->StackBase) - &here;
+            if (used > 400 * 1024) Log("overlay: 栈已用 %llu KB（栈顶 %p）", used / 1024, tib->StackBase);
+        }
+        RenderPanel(sc);
+    }
         ::QueryPerformanceCounter(&q1);
         if (!g_open.load()) PerfTick((unsigned long long)q0.QuadPart, (unsigned long long)q1.QuadPart);
     }
@@ -473,6 +760,7 @@ HRESULT WINAPI HkPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 // 游戏要换后台缓冲：D3D11 先放掉手上的 RTV；D3D12 等自己提交的命令跑完（缓冲本来就不长期持有）
 void BeforeResize(IDXGISwapChain* sc)
 {
+    SetStage("resize");
     if (sc != g_sc) return;
     if (g_api == kD3D11) ReleaseRtv();
     else if (g_api == kD3D12) WaitGpu12();
@@ -547,6 +835,7 @@ void** GetSwapChainVtable(std::string& err, void*** vt3)
     return vt;
 }
 
+
 } // namespace
 
 bool Install(const Callbacks& cb, std::string& err)
@@ -555,6 +844,8 @@ bool Install(const Callbacks& cb, std::string& err)
     void** vt3 = nullptr;
     void** vt = GetSwapChainVtable(err, &vt3);
     if (!vt) return false;
+    g_swapVt = vt;
+    g_swapVt3 = vt3;
     // IDXGISwapChain 虚表：8 = Present，13 = ResizeBuffers；IDXGISwapChain3：39 = ResizeBuffers1（DX12 游戏可能用它）
     if (!PatchSlot(&vt[8], reinterpret_cast<void*>(HkPresent), reinterpret_cast<void**>(&g_present)) ||
         !PatchSlot(&vt[13], reinterpret_cast<void*>(HkResize), reinterpret_cast<void**>(&g_resize))) {
@@ -576,5 +867,90 @@ bool IsOpen() { return g_open.load() && !g_failed.load(); }
 bool Failed() { return g_failed.load(); }
 void SetDebugAfterDraw(void (*fn)(void*)) { g_debugAfterDraw = fn; }
 void SetDebugAfterDraw12(void (*fn)(void*, void*)) { g_debugAfterDraw12 = fn; }
+
+void Shutdown(bool processExiting)
+{
+    if (!g_inited) return;
+    SetStage("shutdown");
+    Log("overlay: 收尾（api=%d，%s）", (int)g_api, processExiting ? "进程退出" : "正常卸载");
+    if (processExiting) {
+        // 进程正在退出：这一段什么都不做，一行日志之后就走人。
+        // 教训（0.7.23~0.7.27 一直卡在这里）：
+        //   SetWindowLongPtrW 是跨线程调用，窗口已销毁时它会等窗口线程；
+        //   ImeRequest 会 PostMessage 到那个窗口；
+        //   两者都能让 DllMain 在 loader lock 里一直等下去 —— 表现就是
+        //   画面没了、BGM 还在响、进程永远不退出。
+        // 进程马上就结束了，窗口过程、输入法、D3D 对象都交给系统回收。
+        Log("overlay: 进程退出：不做任何收尾");
+        g_inited = false;
+        return;
+    }
+    if (g_api == kD3D11) ImGui_ImplDX11_Shutdown();
+    else if (g_api == kD3D12) ImGui_ImplDX12_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    if (ImGui::GetCurrentContext()) ImGui::DestroyContext();
+    ReleaseRtv();
+    if (g_list) { g_list->Release(); g_list = nullptr; }
+    for (UINT i = 0; i < kMaxBuffers; ++i)
+        if (g_alloc[i]) { g_alloc[i]->Release(); g_alloc[i] = nullptr; }
+    if (g_fence) { g_fence->Release(); g_fence = nullptr; }
+    if (g_fenceEvent) { ::CloseHandle(g_fenceEvent); g_fenceEvent = nullptr; }
+    if (g_rtvHeap) { g_rtvHeap->Release(); g_rtvHeap = nullptr; }
+    if (g_srvHeap) { g_srvHeap->Release(); g_srvHeap = nullptr; }
+    if (g_sc3) { g_sc3->Release(); g_sc3 = nullptr; }
+    g_dev12 = nullptr;   // 不是我们的引用，别释放
+    ID3D12CommandQueue* q = g_queue.exchange(nullptr);
+    if (q) q->Release();
+    if (g_ctx) { g_ctx->Release(); g_ctx = nullptr; }
+    g_dev = nullptr;   // 同上
+    if (g_imeAttached && g_hwnd && ::GetCurrentThreadId() == ::GetWindowThreadProcessId(g_hwnd, nullptr)) {
+        ImeOffWindowThread();
+        g_imeAttached = false;
+    }
+    if (g_hwnd && g_wndProc) {
+        ::SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_wndProc));
+        g_wndProc = nullptr;
+    }
+    g_inited = false;
+}
+
+// 游戏退出时只做这一件事。D3D 资源的释放会走驱动（实测 amdxc64 崩），
+// 而进程马上就要结束，让系统回收更安全 —— 退出路径上我们一个驱动调用都不做。
+void ShutdownForExit()
+{
+    // 只写一行日志，然后什么都不做。特别是不去 SetWindowLongPtrW：
+    // 那是跨线程调用，窗口正在销毁时它会等窗口线程，而窗口线程可能正卡在
+    // DestroyWindow 里等我们 —— 实测这种情况下进程会一直不退出（BGM 还在响）。
+    Log("overlay: 退出路径：停面板、放开交换链引用");
+    g_dead = true;         // Present 从下一帧起只转发，不再画面板
+    g_open = false;        // 面板视为已关闭（游戏那侧再也不该被我们挡输入了）
+    g_wndProc = nullptr;   // 窗口马上就没了，不去动它
+    // 这里只放开我们对「游戏对象」的引用，这几步都是纯 COM 引用计数，不会进驱动：
+    //   g_sc3  是我们 QueryInterface 拿到的交换链引用，攥着它游戏就销毁不掉交换链；
+    //   g_alloc 里的包装各自持有后备缓冲的 ID3D12Resource 引用，同理。
+    // 我们自己建的堆/PSO/围栏一律不动（那些释放会进驱动，进程马上结束，交给系统）。
+    for (UINT i = 0; i < kMaxBuffers; ++i)
+        if (g_alloc[i]) { g_alloc[i]->Release(); g_alloc[i] = nullptr; }
+    if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
+    if (g_sc3) { g_sc3->Release(); g_sc3 = nullptr; }
+    Log("overlay: 已放开交换链/后备缓冲引用");
+    // 把打进游戏虚表的钩子还原成原函数：验证「退出卡住」是不是 DXGI 销毁流程中
+    // 走到我们的 Present/Resize 钩子引起的。还原之后游戏退出路径上完全看不到我们。
+    UnpatchSlot(&g_swapVt[8], reinterpret_cast<void*>(g_present));
+    UnpatchSlot(&g_swapVt[13], reinterpret_cast<void*>(g_resize));
+    if (g_swapVt3) UnpatchSlot(&g_swapVt3[39], reinterpret_cast<void*>(g_resize1));
+    if (g_queueVt) UnpatchSlot(&g_queueVt[10], reinterpret_cast<void*>(g_execute));
+    Log("overlay: 虚表钩子已还原（Present/ResizeBuffers/ResizeBuffers1/ExecuteCommandLists）");
+    g_inited = false;
+}
+
+const char* Stage() { return g_stage.load(); }
+
+bool WindowGone()
+{
+    const HWND h = g_hwnd;
+    return h != nullptr && ::IsWindow(h) == FALSE;
+}
+void SetImeEnabled(bool on) { g_imeEnabled = on; if (!on) ImeRequest(false, false); }
 
 } // namespace overlay

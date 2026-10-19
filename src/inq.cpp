@@ -532,11 +532,11 @@ void RequestRestart(const Config& cfg)
         return;
     }
     if (g.restart != 0) return;
-    if (!cfg.activeSet.empty()) {
-        if (const LoadoutSet* s = cfg.FindSet(cfg.activeSet)) QueueSet(*s);
-        else Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：配置里没有叫「%s」的全套",
-                                     "Better-IN-Q: no loadout set named \"%s\" in the config",
-                                     "Better-IN-Q：設定に「%s」というセットがありません"), cfg.activeSet.c_str()));
+    if (cfg.activeSet != 0) {
+        if (const LoadoutSet* s = cfg.FindSetById(cfg.activeSet)) QueueSet(*s);
+        else Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：配置里没有编号 %d 的全套",
+                                     "Better-IN-Q: no loadout #%d in the config",
+                                     "Better-IN-Q：設定にセット番号 %d がありません"), cfg.activeSet));
     }
     g.restart = 1;
 }

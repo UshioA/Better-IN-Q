@@ -482,6 +482,7 @@ int Import(const std::wstring& path, Config& cfg, std::string& err, std::string*
     // 导入就是覆盖：原版的全套和猫饭直接顶掉现在的，不做合并
     cfg.sets.clear();
     cfg.foods.clear();
+        cfg.foodOrder.clear();
 
     std::string oddStatus, oddMeal;
     int withMeal = 0, noMeal = 0;
@@ -496,16 +497,14 @@ int Import(const std::wstring& path, Config& cfg, std::string& err, std::string*
     // 面板的打开快捷键不导：原版根本没有面板，这一项是插件自己加的
     (void)p.hkOpen;
 
-    std::map<std::string, int> seen;
     int imported = 0;
     int index = 0;
     for (const Entry& e : p.sets) {
         ++index;
         LoadoutSet s;
+        s.id = cfg.NextSetId();
         s.name = Trim(e.name);
         if (s.name.empty()) s.name = "Set " + std::to_string(index);
-        const int nth = ++seen[s.name];
-        if (nth > 1) s.name += " (" + std::to_string(nth) + ")";
         s.equip = e.equip;
         s.item = e.item;
         s.linkRadial = e.linkRadial;
@@ -556,6 +555,10 @@ int Import(const std::wstring& path, Config& cfg, std::string& err, std::string*
         cfg.sets.push_back(s);
         ++imported;
     }
+
+    // 编号都是这次重新发的：原来的全局引用可能指向不存在的套装 / 猫饭
+    if (!cfg.FindSetById(cfg.activeSet)) cfg.activeSet = 0;
+    if (!cfg.foods.count(cfg.food)) cfg.food = 0;
 
     if (notes) {
         std::string out;

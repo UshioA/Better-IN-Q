@@ -1,4 +1,5 @@
 #include "config.h"
+#include "log.h"
 
 #include <windows.h>
 #include <cstdlib>
@@ -80,9 +81,9 @@ std::string Render(const Config& c)
     o += kv("WyvernStart", num(c.wyvern), i18n::Tr("1 = 普通地图用翼龙起始",
                                                    "1 = start normal maps with the wingdrake",
                                                    "1 = 通常マップは翼竜で開始"));
-    o += kv("ActiveSet", c.activeSet, i18n::Tr("重开时套用的全套（下面 [Set.名字]），空 = 不套",
-                                               "Set to apply on restart (a [Set.name] below), empty = none",
-                                               "再開時に適用するセット（下の [Set.名前]）、空 = 適用しない"));
+    o += kv("ActiveSet", num(c.activeSet), i18n::Tr("重开时套用的全套编号（下面 [Set.编号] 的数字），0 = 不套",
+                                                    "Number of the loadout to apply on restart (the n in [Set.n]), 0 = none",
+                                                    "再開時に適用するセット番号（下の [Set.番号] の数字）、0 = 適用しない"));
     o += kv("Food", num(c.food), i18n::Tr("每次进任务都吃的猫饭（下面 [Food.编号]），0 = 不管",
                                           "Meal eaten on every quest start (a [Food.n] below), 0 = leave it",
                                           "クエスト開始ごとに食べる猫飯（下の [Food.番号]）、0 = 変更しない"));
@@ -98,6 +99,16 @@ std::string Render(const Config& c)
     o += kv("SdrNits", num(c.sdrNits), i18n::Tr("SDR 白点亮度（Windows 显示设置里的 SDR 内容亮度），默认 203",
                                                  "SDR white level in nits (Windows SDR content brightness), default 203",
                                                  "SDR 白の輝度（Windows の SDR コンテンツの明るさ）、既定 203"));
+    {
+        std::string order;
+        for (int id : c.FoodIds()) {
+            if (!order.empty()) order += ',';
+            order += std::to_string(id);
+        }
+        o += kv("FoodOrder", order, i18n::Tr("猫饭在面板里的排列顺序（编号用逗号隔开；留空 = 按编号排）",
+                                             "Order of the meals in the panel (comma separated ids; empty = by id)",
+                                             "パネル内の猫飯の並び順（ID をカンマ区切り；空 = ID 順）"));
+    }
     o += kv("Language", c.language, i18n::Tr("界面语言 zh / en / ja，auto = 跟系统界面语言",
                                             "UI language: zh / en / ja, auto = follow the system UI language",
                                             "表示言語 zh / en / ja、auto = OS の表示言語に従う"));
@@ -110,6 +121,10 @@ std::string Render(const Config& c)
                   "; 切り分け用：指定したフィルタを切る（pad / cursor / kbd / din / overlay、カンマ区切り；all = 前四つ）。\r\n"
                   "; 普段は空のまま。切った種類の入力はゲームに漏れます。\r\n");
     o += kv("Disable", c.debugDisable, "");
+    o += kv("ForceQuit", c.debugForceQuit ? "1" : "0",
+            i18n::Tr("窗口销毁后若进程还不退出，4 秒后主动结束（默认 1；排查退出问题时可以设 0）",
+                     "End the process 4s after the window is gone if it has not exited (default 1)",
+                     "ウィンドウが消えて 4 秒後も終了しない場合にプロセスを終了（既定 1）"));
 
     o += "\r\n[Hotkeys]\r\n";
     o += i18n::Tr("; 手柄：A B X Y LB RB LT RT LS RS Up Down Left Right View Menu\r\n",
@@ -130,11 +145,17 @@ std::string Render(const Config& c)
                   "\r\n; Loadout: Equip/Item takes the in-game loadout name, or the number shown in the game\r\n",
                   "\r\n; セット：Equip/Item にはゲーム内のセット名か、ゲームの一覧に出る番号を書く\r\n");
     if (c.sets.empty())
-        o += i18n::Tr(";[Set.示例]\r\n;Equip=1\r\n;Item=1\r\n;LinkRadial=0\r\n;Food=1\r\n;Quest=66845\r\n",
-                      ";[Set.example]\r\n;Equip=1\r\n;Item=1\r\n;LinkRadial=0\r\n;Food=1\r\n;Quest=66845\r\n",
-                      ";[Set.例]\r\n;Equip=1\r\n;Item=1\r\n;LinkRadial=0\r\n;Food=1\r\n;Quest=66845\r\n");
+        o += i18n::Tr(";[Set.1]\r\n;Name=示例\r\n;Equip=1\r\n;Item=1\r\n;LinkRadial=0\r\n;Food=1\r\n;Quest=66845\r\n",
+                      ";[Set.1]\r\n;Name=example\r\n;Equip=1\r\n;Item=1\r\n;LinkRadial=0\r\n;Food=1\r\n;Quest=66845\r\n",
+                      ";[Set.1]\r\n;Name=例\r\n;Equip=1\r\n;Item=1\r\n;LinkRadial=0\r\n;Food=1\r\n;Quest=66845\r\n");
+    int writeId = 0;
     for (const auto& s : c.sets) {
-        o += "[Set." + s.name + "]\r\n";
+        ++writeId;
+        const int id = s.id > 0 ? s.id : writeId;
+        o += "[Set." + std::to_string(id) + "]\r\n";
+        o += kv("Name", s.name, i18n::Tr("面板里显示的名字，可以重名",
+                                          "shown in the panel; duplicates are allowed",
+                                          "パネルに表示する名前。重複可"));
         o += kv("Equip", s.equip, "");
         o += kv("Item", s.item, "");
         o += kv("LinkRadial", num(s.linkRadial), i18n::Tr("套道具时联动快捷栏",
@@ -151,10 +172,11 @@ std::string Render(const Config& c)
                   "; 猫飯：HP 0~5（+0~+50） Stamina 0~2（+0/+25/+50） Attack/Defense/ElemRes 0~3（なし/小/中/大）"
                   " Skills はスキル番号 3 つ、-1 = なし\r\n");
     if (c.foods.empty())
-        o += ";[Food.1]\r\n;HP=5\r\n;Stamina=2\r\n;Attack=3\r\n;Defense=0\r\n;ElemRes=0\r\n;Skills=9,32,39\r\n";
+        o += ";[Food.1]\r\n;Name=日常\r\n;HP=5\r\n;Stamina=2\r\n;Attack=3\r\n;Defense=0\r\n;ElemRes=0\r\n;Skills=9,32,39\r\n";
     for (const auto& kvp : c.foods) {
         const FoodPreset& f = kvp.second;
         o += "[Food." + num(kvp.first) + "]\r\n";
+        o += kv("Name", f.name, i18n::Tr("名字，空 = 就叫「猫饭 N」", "Name; empty = \"Meal N\"", "名前。空 = 「猫飯 N」"));
         o += kv("HP", num(f.hp), "");
         o += kv("Stamina", num(f.stamina), "");
         o += kv("Attack", num(f.attack), "");
@@ -183,11 +205,146 @@ bool SaveDefaultConfig(const std::wstring& path)
     return WriteAll(path, Render(Config()), CREATE_NEW);
 }
 
+std::vector<int> Config::FoodIds() const
+{
+    std::vector<int> out;
+    for (int id : foodOrder) {
+        if (!foods.count(id)) continue;
+        bool dup = false;
+        for (int o : out) if (o == id) { dup = true; break; }
+        if (!dup) out.push_back(id);
+    }
+    for (const auto& kv : foods) {
+        bool dup = false;
+        for (int o : out) if (o == kv.first) { dup = true; break; }
+        if (!dup) out.push_back(kv.first);
+    }
+    return out;
+}
+
+void SwitchProfile(Config& cur, const std::wstring& fromPath, const std::wstring& toPath)
+{
+    if (fromPath != toPath) SaveConfig(fromPath, cur);   // 先把这一档的改动落盘
+
+    Config other;
+    std::string err;
+    if (!LoadConfig(toPath, other, err)) Log("config: %s", err.c_str());
+
+    cur.ClearLoadouts();
+    cur.sets = other.sets;
+    cur.foods = other.foods;
+    cur.foodOrder = other.FoodIds();
+    cur.activeSet = other.activeSet;
+    cur.food = other.food;
+    SaveConfig(toPath, cur);
+}
+
+void Config::ClearLoadouts()
+{
+    sets.clear();
+    foods.clear();
+    foodOrder.clear();
+    activeSet = 0;
+    food = 0;
+}
+
+void Config::NormalizeFoodOrder() { foodOrder = FoodIds(); }
+
 bool SaveConfig(const std::wstring& path, const Config& cfg)
 {
     const std::wstring tmp = path + L".tmp";
     if (!WriteAll(tmp, Render(cfg), CREATE_ALWAYS)) return false;
     return ::MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+}
+
+// 把 Render() 出来的整份文本拆成「base 段」和「profile 段」。
+// profile 段 = 所有 [Set.*] / [Food.*] 段，加上 [General] 里的 ActiveSet / Food / FoodOrder。
+namespace {
+void SplitText(const std::string& full, std::string& baseOut, std::string& profOut)
+{
+    baseOut.clear();
+    profOut.clear();
+    std::string sec;
+    bool baseGeneral = false;   // base 里已经出现过 [General]
+    bool profGeneral = false;   // profile 里已经出现过 [General]
+    std::size_t pos = 0;
+    while (pos <= full.size()) {
+        const std::size_t eol = full.find('\n', pos);
+        const std::size_t end = (eol == std::string::npos) ? full.size() : eol;
+        std::string line = full.substr(pos, end - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        pos = (eol == std::string::npos) ? full.size() + 1 : eol + 1;
+        if (eol == std::string::npos && line.empty()) break;
+
+        const bool isHeader = !line.empty() && line[0] == '[' && line.back() == ']';
+        if (isHeader) {
+            sec = line.substr(1, line.size() - 2);
+            const bool loadoutSec = sec.rfind("Set.", 0) == 0 || sec.rfind("Food.", 0) == 0;
+            if (loadoutSec) { profOut += line; profOut += "\r\n"; }
+            else {
+                baseOut += line; baseOut += "\r\n";
+                if (sec == "General") { baseGeneral = true; profGeneral = false; }
+            }
+            continue;
+        }
+        const bool loadoutSec = sec.rfind("Set.", 0) == 0 || sec.rfind("Food.", 0) == 0;
+        if (loadoutSec) { profOut += line; profOut += "\r\n"; continue; }
+
+        bool toProf = false;
+        if (sec == "General") {
+            const std::size_t eq = line.find('=');
+            if (eq != std::string::npos && !line.empty() && line[0] != ';' && line[0] != '#') {
+                const std::string key = Trim(line.substr(0, eq));
+                toProf = key == "ActiveSet" || key == "Food" || key == "FoodOrder";
+            }
+        }
+        if (toProf) {
+            if (!profGeneral) { profOut += "[General]\r\n"; profGeneral = true; }
+            profOut += line; profOut += "\r\n";
+        } else {
+            if (sec == "General") baseGeneral = true;
+            baseOut += line; baseOut += "\r\n";
+        }
+    }
+    if (profOut.empty()) return;
+    profOut = "; 这个文件只放「套装」和「猫饭」（每个存档单独一份）。\r\n"
+              "; 面板设置、快捷键、语言、HDR 这些在同一个插件目录的 BetterINQ.ini 里，那份是所有存档共用的。\r\n\r\n" + profOut;
+}
+}  // namespace
+
+bool SaveSplit(const std::wstring& basePath, const std::wstring& profPath, const Config& cfg)
+{
+    std::string base, prof;
+    SplitText(Render(cfg), base, prof);
+    if (!WriteAll(basePath, base, CREATE_ALWAYS)) return false;
+    if (profPath == basePath) return true;
+    return WriteAll(profPath, prof, CREATE_ALWAYS);
+}
+
+bool LoadSplit(const std::wstring& basePath, const std::wstring& profPath, Config& cfg, std::string& err)
+{
+    if (!LoadConfig(basePath, cfg, err)) return false;
+    const Config fromBase = cfg;
+    if (profPath == basePath) return true;
+    if (::GetFileAttributesW(profPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        // 第一次用：把 base 里已有的套装/猫饭拆到 profile，两份都写一遍
+        return SaveSplit(basePath, profPath, cfg);
+    }
+    if (!LoadConfig(profPath, cfg, err)) { cfg = fromBase; return true; }
+    const Config fromProf = cfg;
+    // 旧格式（0.7.34 及以前）：profile 里连面板设置一起存着。这时以 profile 为准，
+    // 首次存盘会自动把面板那段拆回 base。
+    {
+        std::string profTxt;
+        if (ReadAll(profPath, profTxt) && profTxt.find("[Hotkeys]") != std::string::npos) return true;
+    }
+    cfg = fromBase;
+    cfg.sets = fromProf.sets;
+    cfg.foods = fromProf.foods;
+    cfg.foodOrder = fromProf.foodOrder;
+    cfg.activeSet = fromProf.activeSet;
+    cfg.food = fromProf.food;
+    return true;
 }
 
 bool LoadConfig(const std::wstring& path, Config& cfg, std::string& err)
@@ -201,6 +358,7 @@ bool LoadConfig(const std::wstring& path, Config& cfg, std::string& err)
     }
     cfg = Config();
     std::string sec;
+    std::string activeSetRaw;   // [General] ActiveSet 原样收着，读完再解析（可能是编号，也可能是老格式的名字）
     LoadoutSet* curSet = nullptr;
     FoodPreset* curFood = nullptr;
     std::size_t pos = 0;
@@ -215,9 +373,15 @@ bool LoadConfig(const std::wstring& path, Config& cfg, std::string& err)
             curSet = nullptr;
             curFood = nullptr;
             if (sec.compare(0, 4, "Set.") == 0) {
+                const std::string key = Trim(sec.substr(4));
                 cfg.sets.push_back(LoadoutSet());
                 curSet = &cfg.sets.back();
-                curSet->name = Trim(sec.substr(4));
+                if (!key.empty() && key.find_first_not_of("0123456789") == std::string::npos) {
+                    curSet->id = std::atoi(key.c_str());      // 新格式：[Set.1]
+                } else {
+                    curSet->id = cfg.NextSetId();             // 老格式：[Set.名字]，编号自己发一个
+                    curSet->name = key;
+                }
             } else if (sec.compare(0, 5, "Food.") == 0) {
                 curFood = &cfg.foods[std::atoi(sec.c_str() + 5)];
             }
@@ -233,8 +397,19 @@ bool LoadConfig(const std::wstring& path, Config& cfg, std::string& err)
             else if (k == "Reset") cfg.reset = Bool(v);
             else if (k == "AcceptOnly") cfg.acceptOnly = Bool(v);
             else if (k == "WyvernStart") cfg.wyvern = Bool(v);
-            else if (k == "ActiveSet") cfg.activeSet = v;
+            else if (k == "ActiveSet") activeSetRaw = v;
             else if (k == "Food") cfg.food = n;
+        else if (k == "FoodOrder") {
+            cfg.foodOrder.clear();
+            std::string rest = v;
+            while (!rest.empty()) {
+                const std::size_t p = rest.find(',');
+                const std::string one = rest.substr(0, p);
+                if (!one.empty()) cfg.foodOrder.push_back(std::atoi(one.c_str()));
+                if (p == std::string::npos) break;
+                rest = rest.substr(p + 1);
+            }
+        }
             else if (k == "QuickBlackout") cfg.quickBlackout = Bool(v);
             else if (k == "PanelOpacity") cfg.panelOpacity = n < 30 ? 30 : (n > 100 ? 100 : n);
             else if (k == "Language") cfg.language = v;
@@ -243,18 +418,22 @@ bool LoadConfig(const std::wstring& path, Config& cfg, std::string& err)
             else if (k == "Debug") cfg.debug = n;
         } else if (sec == "Debug") {
             if (k == "Disable") cfg.debugDisable = v;
+            else if (k == "ForceQuit") cfg.debugForceQuit = Bool(v);
+            else Log("ini: [Debug] 里不认识的键 %s（拼写对吗？）", k.c_str());
         } else if (sec == "Hotkeys") {
             if (k == "Restart") cfg.hkRestart = v;
             else if (k == "Panel") cfg.hkPanel = v;
             else if (k == "ResetOnly") cfg.hkResetOnly = v;
         } else if (curSet) {
-            if (k == "Equip") curSet->equip = v;
+            if (k == "Name") curSet->name = v;
+            else if (k == "Equip") curSet->equip = v;
             else if (k == "Item") curSet->item = v;
             else if (k == "LinkRadial") curSet->linkRadial = Bool(v);
             else if (k == "Food") curSet->food = n;
             else if (k == "Quest") curSet->quest = n;
         } else if (curFood) {
-            if (k == "HP") curFood->hp = n;
+            if (k == "Name") curFood->name = v;
+            else if (k == "HP") curFood->hp = n;
             else if (k == "Stamina") curFood->stamina = n;
             else if (k == "Attack") curFood->attack = n;
             else if (k == "Defense") curFood->defense = n;
@@ -271,5 +450,33 @@ bool LoadConfig(const std::wstring& path, Config& cfg, std::string& err)
             }
         }
     }
+    // ActiveSet：新格式是编号，老格式是套装名字
+    if (!activeSetRaw.empty()) {
+        if (activeSetRaw.find_first_not_of("0123456789") == std::string::npos) {
+            cfg.activeSet = std::atoi(activeSetRaw.c_str());
+        } else if (const LoadoutSet* s = cfg.FindSet(activeSetRaw)) {
+            cfg.activeSet = s->id;
+        }
+    }
+    // 编号必须唯一：没写、写 0、或者两份都写了 [Set.1] 的，重新发一个没用过的号
+    {
+        std::vector<int> used;
+        int next = 1;
+        for (const auto& s : cfg.sets) if (s.id >= next) next = s.id + 1;
+        for (auto& s : cfg.sets) {
+            bool clash = s.id <= 0;
+            for (int u : used) if (u == s.id) clash = true;
+            if (clash) {
+                for (;;) {
+                    bool usedAlready = false;
+                    for (int u : used) if (u == next) { usedAlready = true; ++next; break; }
+                    if (!usedAlready) break;
+                }
+                s.id = next++;
+            }
+            used.push_back(s.id);
+        }
+    }
+    cfg.NormalizeFoodOrder();
     return true;
 }

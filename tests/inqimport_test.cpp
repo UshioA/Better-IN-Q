@@ -129,7 +129,8 @@ int main()
     CHECK(cfg.sets.size() == 4, "配置里有 4 个全套（实际 %zu）", cfg.sets.size());
     CHECK(!cfg.sets.empty() && cfg.sets[0].name == "综合套装1", "第一个名字 = %s",
           cfg.sets.empty() ? "" : cfg.sets[0].name.c_str());
-    CHECK(cfg.sets.size() > 1 && cfg.sets[1].name == "综合套装1 (2)", "重名的加序号 = %s",
+    CHECK(cfg.sets.size() > 1 && cfg.sets[1].name == "综合套装1" && cfg.sets[1].id == 2,
+          "重名的原样保留（编号 %d，名字 %s）", cfg.sets.size() > 1 ? cfg.sets[1].id : -1,
           cfg.sets.size() > 1 ? cfg.sets[1].name.c_str() : "");
     CHECK(cfg.sets.size() > 1 && cfg.sets[1].equip == "default9" && cfg.sets[1].item == "default7", "装备/道具套装名跟着走");
     CHECK(cfg.sets.size() > 2 && cfg.sets[2].quest == 66844, "任务 ID = %d", cfg.sets.size() > 2 ? cfg.sets[2].quest : -1);
