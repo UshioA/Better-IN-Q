@@ -24,7 +24,7 @@ if [ "$WHAT" = "dll" ] || [ "$WHAT" = "all" ]; then
     imgui_objs
     g++ -shared $COMMON -s -I$IM -o out/BetterINQ.dll \
         src/main.cpp src/inq.cpp src/hook.cpp src/config.cpp src/input.cpp src/log.cpp \
-        src/ui.cpp src/gamedata.cpp src/overlay.cpp src/padfilter.cpp src/cursorfilter.cpp \
+        src/ui.cpp src/gamedata.cpp src/overlay.cpp src/padfilter.cpp src/cursorfilter.cpp src/hangdump.cpp \
         out/obj/imgui.o out/obj/imgui_draw.o out/obj/imgui_tables.o out/obj/imgui_widgets.o \
         out/obj/imgui_impl_dx11.o out/obj/imgui_impl_dx12.o out/obj/imgui_impl_win32.o \
         -ld3d11 -ld3dcompiler -ldxgi -ldwmapi -limm32 -lgdi32 -lole32 -luuid
@@ -43,13 +43,20 @@ if [ "$WHAT" = "test" ] || [ "$WHAT" = "all" ]; then
         out/obj/imgui_impl_dx11.o out/obj/imgui_impl_dx12.o out/obj/imgui_impl_win32.o \
         -ld3d11 -ld3dcompiler -ldxgi -ldwmapi -limm32 -lgdi32 -lole32 -lwindowscodecs -luuid -lxinput
     g++ $COMMON -municode -I$IM -Isrc -o out/overlay_dx12_test.exe tests/overlay_dx12_test.cpp \
-        src/overlay.cpp src/ui.cpp src/gamedata.cpp src/config.cpp src/input.cpp src/log.cpp \
+        src/ui.cpp src/gamedata.cpp src/config.cpp src/input.cpp src/log.cpp \
         out/obj/imgui.o out/obj/imgui_draw.o out/obj/imgui_tables.o out/obj/imgui_widgets.o \
         out/obj/imgui_impl_dx11.o out/obj/imgui_impl_dx12.o out/obj/imgui_impl_win32.o \
         -ld3d11 -ld3d12 -ld3dcompiler -ldxgi -ldwmapi -limm32 -lgdi32 -lole32 -lwindowscodecs -luuid
     g++ $COMMON -I$IM -Isrc -o out/ui_nav_test.exe tests/ui_nav_test.cpp src/ui.cpp src/gamedata.cpp src/config.cpp src/input.cpp \
         out/obj/imgui.o out/obj/imgui_draw.o out/obj/imgui_tables.o out/obj/imgui_widgets.o out/obj/imgui_impl_dx11.o \
         -ld3d11 -ld3dcompiler
+    g++ $COMMON -I$IM -Isrc -o out/window_chain_test.exe tests/window_chain_test.cpp src/hdr.cpp src/log.cpp src/i18n.cpp src/hangdump.cpp \
+        out/obj/imgui.o out/obj/imgui_draw.o out/obj/imgui_tables.o out/obj/imgui_widgets.o \
+        out/obj/imgui_impl_dx11.o out/obj/imgui_impl_dx12.o out/obj/imgui_impl_win32.o \
+        -ld3d11 -ld3d12 -ld3dcompiler -ldxgi -ldwmapi -limm32 -lgdi32 -lole32 -luuid
+    g++ $COMMON -Isrc -o out/runtime_state_test.exe tests/runtime_state_test.cpp
+    ./out/window_chain_test.exe
+    ./out/runtime_state_test.exe
     ./out/hook_test.exe
     ./out/config_test.exe
     ./out/cursor_test.exe

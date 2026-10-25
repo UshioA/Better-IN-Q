@@ -6,13 +6,16 @@
 // ============================================================================
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "config.h"
+#include "crashfilter.h"
 #include "cursorfilter.h"
+#include "hangdump.h"
 #include "hdr.h"
 #include "dinfilter.h"
 #include "i18n.h"
@@ -20,6 +23,7 @@
 #include "profile.h"
 #include "hook.h"
 #include "inq.h"
+#include "runtime_state.h"
 #include "input.h"
 #include "kbdfilter.h"
 #include "log.h"
@@ -34,7 +38,10 @@ namespace {
 HMODULE g_module = nullptr;
 volatile LONG g_stop = 0;
 volatile LONG g_teardown = 0;   // 窗口已销毁/进程在退出，这时候别再写日志了
-const char* const kVersion = "0.7.1";
+// 窗口已经没了、我们正在收尾：异常处理器从此一律不碰（见 OnCrash）。
+std::atomic<bool> g_exiting{false};
+std::atomic<long> g_inCrash{0};
+const char* const kVersion = "0.7.2";
 
 // 主循环线程和游戏渲染线程（画面板）共用，都要先拿这把锁
 std::mutex g_mx;
@@ -89,15 +96,7 @@ struct Hotkeys {
         specs[2] = c.hkResetOnly;
         restart = ParseHotkey(c.hkRestart);
         panel = ParseHotkey(c.hkPanel);
-        // 手柄不能开面板（和 SharpPluginLoader 一样只用键盘）：ini 里写了手柄组合也丢掉。
-        // 这样就不需要「先把按键扣住、看会不会凑成组合键」那一层，单键永远直通。
-        {
-            const std::size_t before = panel.alts.size();
-            panel.alts.erase(std::remove_if(panel.alts.begin(), panel.alts.end(),
-                                            [](const Combo& c) { return c.IsPad() && c.keys.empty(); }),
-                             panel.alts.end());
-            if (panel.alts.size() != before) Log("hotkey Panel: 手柄组合不能用，只留键盘");
-        }
+        // 和重开键一样旁路轮询手柄组合；面板关闭时不扣留、延迟或吞掉游戏输入。
         resetOnly = ParseHotkey(c.hkResetOnly);
         LogHotkey("Restart", c.hkRestart, restart);
         LogHotkey("Panel", c.hkPanel, panel);
@@ -189,6 +188,7 @@ DWORD WINAPI Worker(LPVOID)
     ::CreateDirectoryW(dir.c_str(), nullptr);
     LogInit(dir + L"BetterINQ.log");
     ::AddVectoredExceptionHandler(1, OnCrash);   // 崩溃时把出错地址写进日志
+    hangdump::Init();                            // 现在就把 dbghelp 拿好，退出卡住时才有栈可看
 
     // 配置按「Steam 账号 + 存档位」分开放：同一台电脑换账号、同一账号换存档都不串
     profile::Init(dir);
@@ -252,6 +252,7 @@ DWORD WINAPI Worker(LPVOID)
     cb.opened = OnOverlayOpened;
     cb.draw = OnOverlayDraw;
     std::string err;
+    if (g_cfg.debugNoWndHook) overlay::SetWndHook(false);   // 要在 Install 之前设，窗口过程是那时接管的
     const bool panelOk = off.overlay ? false : overlay::Install(cb, err);
     if (off.overlay) Log("debug: overlay 关掉了，没有面板（快捷键重开照常）");
     else if (!panelOk) Log("overlay: %s", err.c_str());
@@ -267,7 +268,9 @@ DWORD WINAPI Worker(LPVOID)
     if (!off.cursor) filters.push_back({"cursorfilter", cursorfilter::Install, cursorfilter::Installed});
     if (!off.kbd) filters.push_back({"kbdfilter", kbdfilter::Install, kbdfilter::Installed});
     if (!off.din) filters.push_back({"dinfilter", dinfilter::Install, dinfilter::Installed});
-    ULONGLONG lastTick = 0, dirtyAt = 0;
+    ULONGLONG lastTick = 0, dirtyAt = 0, lastNamesRefresh = 0;
+    bool migrated = false;      // 老配置里的套装名字只换一次编号
+    int migrateTries = 0;
     // 诊断：主循环每 16ms 醒一次，看看我们自己花了多少时间（延迟排查用，每 30 秒写一行）
     ULONGLONG perfAt = ::GetTickCount64();
     double pollSum = 0, pollMax = 0;
@@ -278,16 +281,22 @@ DWORD WINAPI Worker(LPVOID)
     // 只有「连 arena 都没拿到」才是安全可重试的（那种情况一个钩子都还没装）。
     ULONGLONG inqRetryAt = 0;
     int inqTries = 0;
+    runtime::Mode runtimeMode = g_cfg.enabled ? runtime::Mode::Active : runtime::Mode::Dormant;
     while (!g_stop) {
         if (overlay::WindowGone()) {
             // 窗口没了说明游戏正在收尾：趁 D3D 设备还活着，自己先把手上的引用和
             // ImGui 后端放掉，别让游戏的析构去等我们，也别拖到 DLL_PROCESS_DETACH 那一刻。
             Log("worker: 游戏窗口已经销毁，提前收尾");
+            g_exiting = true;      // 异常处理器从此闭嘴：退出路径上任何文件 IO 都可能把别人等死
+            // 线程栈诊断先挂上：万一我们自己的收尾卡住，6 秒 / 14 秒的 dump 照样能写出来
+            // （诊断线程是独立线程，不依赖主循环，也不依赖我们的收尾是否跑完）。
+            hangdump::Arm(6000, 14000);
+            SetPanel(false);       // 面板要是还开着，先把四路输入过滤全放开，别带着拦截进退出流程
             overlay::ShutdownForExit();
             if (g_cfg.debugForceQuit) {
                 // 兜底：窗口已销毁、我们的收尾也做完了，游戏自己卡在 DXGI/音频销毁里不走
                 // （画面没了、BGM 还在、手柄还能动）。窗口既然没了，存档早已落盘，
-                // 4 秒后还没退就由我们把进程带走。
+                // 10 秒（3 + 7）还没退就由我们把进程带走。
                 std::thread([] {
                     ::Sleep(3000);
                     Log("watchdog: 窗口销毁 3 秒后进程仍在，继续等到 10 秒");
@@ -371,13 +380,41 @@ DWORD WINAPI Worker(LPVOID)
 
         {
             std::lock_guard<std::mutex> lk(g_mx);
-            if (!open && restartKey) { Log("hotkey: restart"); inq::RequestRestart(g_cfg); }
-            if (!open && resetKey) { Log("hotkey: reset only"); inq::RequestResetOnly(); }
-
             ui::Model& m = g_model;
+
+            // UI 在渲染线程先改 Config、再提 reqSave；必须先发布状态过渡，避免同一帧关掉功能又执行旧请求。
+            const runtime::Mode wantedMode = g_cfg.enabled ? runtime::Mode::Active : runtime::Mode::Dormant;
+            if (wantedMode != runtimeMode) {
+                const runtime::TransitionPlan plan = runtime::PlanTransition(runtimeMode, wantedMode);
+                if (plan.enableInq) inq::ApplyOptions(g_cfg);
+                else inq::SetEnabled(false);
+                if (plan.closePanel) SetPanel(false);   // 同时让四路输入过滤恢复，面板快捷键之后仍可再打开
+                if (plan.unblockInputs && g_blocked) SetPanel(false);
+                m.reqRestart = false;
+                m.reqResetOnly = false;
+                m.reqApplyEquip = false;
+                runtimeMode = wantedMode;
+                Log("runtime: %s", runtimeMode == runtime::Mode::Active ? "装载态" : "卸载态（业务旁路，钩子常驻）");
+            }
+
+            const runtime::HotkeyActions actions = runtime::GateHotkeys(runtimeMode, false, restartKey, resetKey);
+            if (!open && actions.restart) { Log("hotkey: restart"); inq::RequestRestart(g_cfg); }
+            if (!open && actions.resetOnly) { Log("hotkey: reset only"); inq::RequestResetOnly(); }
+
             if (m.reqClose) { m.reqClose = false; SetPanel(false); }
-            if (m.reqRestart) { m.reqRestart = false; Log("panel: restart"); inq::RequestRestart(g_cfg); }
-            if (m.reqResetOnly) { m.reqResetOnly = false; Log("panel: reset only"); inq::RequestResetOnly(); }
+            if (m.reqRestart) {
+                m.reqRestart = false;
+                if (runtimeMode == runtime::Mode::Active) { Log("panel: restart"); inq::RequestRestart(g_cfg); }
+            }
+            if (m.reqResetOnly) {
+                m.reqResetOnly = false;
+                if (runtimeMode == runtime::Mode::Active) { Log("panel: reset only"); inq::RequestResetOnly(); }
+            }
+            if (m.reqApplyEquip) {
+                m.reqApplyEquip = false;
+                if (runtimeMode == runtime::Mode::Active && !m.reqSlot && !m.reqImportInq)
+                    inq::RequestActiveSetEquipApply(g_cfg);
+            }
             if (m.reqImportInq) {        // 设置页的文件选择框里挑好了 config.txt
                 m.reqImportInq = false;
                 const std::wstring src = m.inqPath;      // 选择框里挑好的
@@ -385,11 +422,21 @@ DWORD WINAPI Worker(LPVOID)
                 std::string ierr, inotes;
                 const int n = src.empty() ? -1 : inqimport::Import(src, g_cfg, ierr, &inotes);
                 if (n > 0) {
+                    inq::CancelPending(); // 导入替换套装后，旧编号的待办不能继续提交。
+                    // 原版存的是名字，我们存编号：趁现在游戏里的名单还在，换过来
+                    const int lostNames = inq::NormalizeEquipItemNumbers(g_cfg);
+                    // 导入把套装/猫饭整个换掉、编号重新发，生效值要跟着重算
+                    inq::ApplyOptions(g_cfg);
                     if (!SaveSplit(basePath, cfgPath, g_cfg)) Log("config: 存盘失败");
                     Log("import: %d 个全套（%s）", n, inotes.c_str());
                     Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：从原版 IN-Q 导入了 %d 个全套",
                                             "Better-IN-Q: imported %d loadouts from IN-Q",
                                             "Better-IN-Q：旧 IN-Q から %d 件取り込みました"), n));
+                    if (lostNames > 0)
+                        Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：有 %d 个装备/道具套装名在游戏里没找到，已留空，请到套装页重选",
+                                                "Better-IN-Q: %d equip/item loadout names were not found and left empty; pick them again in the sets page",
+                                                "Better-IN-Q：%d 件の装備/アイテムセット名が見つからず空にしました。セット画面で選び直してください"),
+                                      lostNames));
                 } else if (src.empty()) {
                     Chat(i18n::Tr("Better-IN-Q：没选文件", "Better-IN-Q: no file picked",
                                   "Better-IN-Q：ファイルが選ばれていません"));
@@ -406,6 +453,7 @@ DWORD WINAPI Worker(LPVOID)
                     // 换存档只换「这个档里的东西」：面板设置写进共用的 base，跟着人走；
                     // 套装和猫饭归存档——切到哪一档就读那一档的 profile，没配过就是空的。
                     if (!SaveSplit(basePath, cfgPath, g_cfg)) Log("config: 存盘失败");
+                    inq::CancelPending(); // 丢弃旧存档的立即换装和其他未提交请求。
                     profile::SetSlot(want);
                     cfgPath = profile::ConfigPath();
                     g_cfg.ClearLoadouts();
@@ -424,6 +472,19 @@ DWORD WINAPI Worker(LPVOID)
                         g_cfg.foods.size());
                 }
             }
+            // 全局任务跟着「实际进去了的那一关」走：重开的和柜台自己接的都算。
+            // 取消套用之后重开才不会退回更早手工选过的任务。
+            if (g_cfg.enabled) {
+                if (const int entered = inq::TakeEnteredQuest()) {
+                    if (g_cfg.questId != entered) {
+                        g_cfg.questId = entered;
+                        m.reqSave = true;
+                        Log("quest: 进过 %d，全局任务跟着改成它", entered);
+                    }
+                }
+            } else {
+                (void)inq::TakeEnteredQuest();
+            }
             if (m.reqSave) {             // 设置马上生效；写盘等停手 0.4 秒，免得打一个字存一次
                 m.reqSave = false;
                 inq::ApplyOptions(g_cfg);
@@ -434,12 +495,30 @@ DWORD WINAPI Worker(LPVOID)
                 if (!SaveSplit(basePath, cfgPath, g_cfg)) Log("config: 存盘失败");
                 hk.Parse(g_cfg);
             }
-            if (g_refreshNames) {
+            // 游戏里改名、保存/删除套装不会通知面板；定期重读而非等插件重启。
+            // 开面板/切档仍立即刷新，平时每 0.5 秒刷新，编号与存放格引用不变。
+            if (g_refreshNames || now - lastNamesRefresh >= 500) {
                 g_refreshNames = false;
+                lastNamesRefresh = now;
                 m.equipNames.clear();
                 m.itemNames.clear();
-                for (const auto& e : inq::ListEquipLoadouts()) m.equipNames.push_back({e.number, e.name});
-                for (const auto& it : inq::ListItemLoadouts()) m.itemNames.push_back({it.number, it.name});
+                for (const auto& e : inq::ListEquipLoadouts()) m.equipNames.push_back({e.number, e.name, e.store});
+                for (const auto& it : inq::ListItemLoadouts()) m.itemNames.push_back({it.number, it.name, it.store});
+            }
+            // 0.7.1 及以前面板把装备/道具套装按名字存进 ini，删掉读取兼容之后这些值没人认了。
+            // 进存档、拿得到游戏里的名单之后换成编号并写回（一次性改写，不是读取兼容）。
+            // 一秒试一次，读到名单之前什么都不改。
+            if (!migrated && NeedsLoadoutMigration(g_cfg) && ++migrateTries % 60 == 1) {
+                if (const int changed = inq::MigrateLoadoutRefs(g_cfg)) {
+                    migrated = true;
+                    if (!SaveSplit(basePath, cfgPath, g_cfg)) Log("config: 存盘失败");
+                    inq::ApplyOptions(g_cfg);
+                    g_refreshNames = true;
+                    Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：老配置里的套装名字已换成编号（%d 处）；没对上的已留空，请到套装页重选",
+                                            "Better-IN-Q: %d old name-based loadout references converted to numbers; unmatched ones are now empty, please re-pick them",
+                                            "Better-IN-Q：古い設定のセット名を %d 件番号に変換しました。一致しなかったものは空にしたので選び直してください"),
+                                      changed));
+                }
             }
             if (now - lastTick >= 100) {
                 lastTick = now;
@@ -466,12 +545,20 @@ extern "C" __declspec(dllexport) BOOL BetterINQ_IsInstalled() { return TRUE; }
 
 // 崩溃时留个记录：异常码、出错地址（哪个模块 + 偏移）、线程、以及当时在哪个钩子里。
 // 只写日志，不吞异常（EXCEPTION_CONTINUE_SEARCH），游戏该崩还是崩 —— 我们要的是线索。
+//
+// 但「记什么」要挑：这是进程里第一个异常处理器，此刻别的线程可能正拿着 loader lock
+// 或者堆锁，我们一写文件就可能把它等死 —— 表现就是「游戏不退」。所以：
+//   · 退出路径（窗口已经销毁）一律不记；
+//   · CLR / C++ 抛异常这类正常控制流不记（SharpPluginLoader 一次启动能抛近百条，
+//     记下来既刷满日志、又正好把危险窗口撑大）；
+//   · 同一个异常已经被记过一遍就不再记（递归/风暴只留第一条）。
 LONG WINAPI OnCrash(EXCEPTION_POINTERS* info)
 {
-    if (g_teardown) return EXCEPTION_CONTINUE_SEARCH;   // 收尾阶段不记日志，别在退出路径上做文件 IO
+    if (g_teardown || g_exiting) return EXCEPTION_CONTINUE_SEARCH;
     if (!info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     const DWORD code = info->ExceptionRecord->ExceptionCode;
-    if (code == 0x406D1388) return EXCEPTION_CONTINUE_SEARCH;   // 给线程起名字，天天有，不记
+    if (!crashfilter::Recordable(code)) return EXCEPTION_CONTINUE_SEARCH;
+    if (g_inCrash.exchange(1)) return EXCEPTION_CONTINUE_SEARCH;   // 已经在记了/记录过程本身出错
     void* addr = info->ExceptionRecord->ExceptionAddress;
     wchar_t path[MAX_PATH] = L"?";
     HMODULE mod = nullptr;
@@ -503,6 +590,7 @@ LONG WINAPI OnCrash(EXCEPTION_POINTERS* info)
             fm ? (unsigned long long)(reinterpret_cast<const char*>(frames[i]) - reinterpret_cast<const char*>(fm)) : 0;
         Log("crash:   #%u %p（%ls+0x%llX）", (unsigned)i, frames[i], fbase, foff);
     }
+    Log("crash: 同一个异常后续不再记录（只留第一条）");
     return EXCEPTION_CONTINUE_SEARCH;
 }
 

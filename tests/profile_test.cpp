@@ -28,8 +28,47 @@ static bool EndsWith(const std::wstring& s, const wchar_t* tail)
     return s.size() >= t.size() && s.compare(s.size() - t.size(), t.size(), t) == 0;
 }
 
+static void TestIdentitySelection()
+{
+    // Pure fixtures only: never create/change Steam registry values or Steam config files.
+    using profile::detail::SelectSteamId;
+    const std::string a = "76561197960265729", b = "76561197960265730";
+    const std::string recentB = "\"users\" { \"" + a + "\" { \"MostRecent\" \"0\" } \"" + b +
+                               "\" { \"PersonaName\" \"escaped \\\"name\\\"\" \"MostRecent\" \"1\" } }";
+    CHECK(SelectSteamId(1, recentB, {"2", "3"}) == a, "ActiveUser wins over VDF and other userdata");
+    CHECK(SelectSteamId(1, "broken", {"2"}) == a, "explicit ActiveUser survives malformed fallback");
+    CHECK(SelectSteamId(0, recentB, {"1"}) == b, "MostRecent wins even without matching userdata");
+    CHECK(SelectSteamId(0, recentB, {"1", "2"}) == b, "MostRecent wins over directory order/time");
+    const std::string noRecent = "\"users\" { \"" + a + "\" { \"MostRecent\" \"0\" } }";
+    CHECK(SelectSteamId(0, noRecent, {}).empty(), "never choose arbitrary first login account");
+    CHECK(SelectSteamId(0, "", {"1"}) == a, "unique valid userdata is last resort");
+    CHECK(SelectSteamId(0, "", {"1", "2"}).empty(), "multiple userdata accounts are ambiguous");
+    CHECK(SelectSteamId(0, "", {"2", "1"}).empty(), "userdata order cannot resolve ambiguity");
+    CHECK(SelectSteamId(0, "", {"0", "-1", "4294967296", "184467440737095516161", "1x", "01"}).empty(),
+          "reject zero, sign, overflow, suffix and noncanonical account IDs");
+    CHECK(SelectSteamId(0, "", {"4294967295"}) == "76561202255233023", "32-bit account boundary");
+    const std::string conflict = "\"users\" { \"" + a + "\" { \"MostRecent\" \"1\" } \"" + b +
+                                 "\" { \"MostRecent\" \"1\" } }";
+    CHECK(SelectSteamId(0, conflict, {"1"}).empty(), "conflicting MostRecent blocks userdata guessing");
+    CHECK(SelectSteamId(0, recentB.substr(0, recentB.size() - 1), {"1"}).empty(),
+          "truncated VDF cannot yield an early identity");
+    CHECK(SelectSteamId(0, "\"users\" { \"bad\" { \"MostRecent\" \"1\" } }", {"1"}).empty(),
+          "invalid explicit SteamID cannot fall through to userdata");
+    CHECK(SelectSteamId(0, "\"users\" { \"76561197960265729\" { \"MostRecent\" \"1\" \"MostRecent\" \"0\" } }", {}).empty(),
+          "duplicate MostRecent keys are rejected");
+    CHECK(SelectSteamId(0, "// Steam cache\n" + recentB, {}) == b, "VDF comments and escaped quotes parse");
+    CHECK(SelectSteamId(0, "\"users\" { \"76561197960265728\" { \"MostRecent\" \"1\" } }", {}).empty(),
+          "zero-account SteamID64 is rejected");
+    CHECK(SelectSteamId(0, "\"users\" { \"76561202255233024\" { \"MostRecent\" \"1\" } }", {}).empty(),
+          "SteamID64 account overflow is rejected");
+    CHECK(SelectSteamId(0, "\"users\" { \"MostRecent\" \"1\" }", {"1"}).empty(),
+          "MostRecent outside account object is not identity");
+    CHECK(SelectSteamId(0, recentB + " trailing", {"1"}).empty(), "trailing malformed VDF is rejected");
+}
+
 int main()
 {
+    TestIdentitySelection();
     // 干净的临时目录（测试自己的，不碰真实插件目录）
     const std::wstring dir = L"out\\profile_test_dir\\";
     system("rmdir /s /q out\\profile_test_dir 2>nul");

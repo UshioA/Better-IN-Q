@@ -9,11 +9,13 @@
 #include "inq.h"
 
 #include "game.h"
+#include "gamedata.h"
 #include "hook.h"
 #include "i18n.h"
 #include "log.h"
 
 #include <windows.h>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -27,6 +29,35 @@ using namespace game;
 using hook::Ctx;
 
 bool g_ready = false;
+// 运行时总闸：钩子永久驻留，Dormant 时所有游戏侧回调纯旁路。
+std::atomic<bool> g_enabled{false};
+std::atomic<unsigned> g_inflight{0};
+// 汇编 call gate 不能直接操作 std::atomic；用 Interlocked 指令维护这两个 32 位闸门。
+alignas(4) volatile std::int32_t g_gateEnabled = 0;
+alignas(4) volatile std::int32_t g_gateInflight = 0;
+
+class ActiveCall {
+public:
+    ActiveCall()
+    {
+        if (!g_enabled.load(std::memory_order_acquire)) return;
+        g_inflight.fetch_add(1, std::memory_order_acq_rel);
+        if (g_enabled.load(std::memory_order_acquire)) active_ = true;
+        else g_inflight.fetch_sub(1, std::memory_order_release);
+    }
+    ~ActiveCall() { if (active_) g_inflight.fetch_sub(1, std::memory_order_release); }
+    explicit operator bool() const { return active_; }
+private:
+    bool active_ = false;
+};
+
+// 「刚进去的那一关」。游戏自己记着最后一次进的任务（不管是我们重开的还是玩家在柜台接的），
+// Tick 里发现变了就存进来，主循环用 TakeEnteredQuest() 取走、写进全局任务。
+std::atomic<int> g_enteredQuest{0};
+// 只用于面板主动选择的立即换装；不与重开的装备待办共用，避免改变重开状态机。
+// 主循环发布，游戏线程消费；后一次选择覆盖前一次，0 取消尚未提交的请求。
+std::atomic<int> g_pendingEquipApply{0};
+int g_enteredSeen = 0;   // 只在游戏线程里读写
 
 enum MsgBit : std::uint32_t { kMsgEquip = 1, kMsgQuest = 2, kMsgCant = 4, kMsgWindow = 8, kMsgNoQuest = 16 };
 
@@ -44,12 +75,37 @@ void CantQ()
 
 void OnApplyResetAndEquip(Ctx* c)
 {
+    ActiveCall call;
+    if (!call) return;
     if ((c->rax & 0xFFFF) != 0x71D0 || (c->rbx & 0xFFFF) != 0x02A0) return;
 
+    // 立即换装也只能借同一个游戏线程落点提交；读盘或 UI 指针链未就绪时保留请求。
+    // 重开仍优先使用它原有的装备队列，不能在重置/接取流程中插入面板换装。
+    int immediate = 0;
+    if (g.equipLoadout == 0 && g.restart == 0) {
+        immediate = g_pendingEquipApply.load(std::memory_order_acquire);
+        if (immediate != 0) {
+            const std::uintptr_t ui = Ui();
+            const std::uintptr_t load = ui ? P(ui + 0x20) : 0;
+            const std::uintptr_t slot = SaveSlot();
+            const std::uintptr_t equipUi = ui ? P(ui + 0x310) : 0;
+            const std::uintptr_t a60 = ui ? P(ui + 0x60) : 0;
+            const std::uintptr_t pageUi = equipUi ? P(equipUi + 0x2960) : 0;
+            const std::uintptr_t indexUi = equipUi ? P(equipUi + 0x2958) : 0;
+            const std::uintptr_t equipObject = a60 ? P(a60 + 0x470) : 0;
+            if (!load || Rd<std::uint32_t>(load + 0x1D04) != 0 || !slot ||
+                !equipUi || a60 < 0x80 || !pageUi || !indexUi || equipObject < 0x5E0 ||
+                !Readable(slot + 0x10CCF4 + std::uintptr_t(immediate - 1) * 0x2B0, 4) ||
+                !Readable(pageUi + 0x240, 4) || !Readable(indexUi + 0x274, 4) ||
+                !Readable(a60 - 0x80 + 0x2A28, 0x40)) return;
+            if (!g_pendingEquipApply.compare_exchange_strong(immediate, 0, std::memory_order_acq_rel)) return;
+        }
+    }
+
     // ---------------- 装备套装 ----------------
-    if (g.equipLoadout != 0) {
-        const std::uint32_t n = (std::uint32_t)g.equipLoadout;
-        g.equipLoadout = 0;
+    if (g.equipLoadout != 0 || immediate != 0) {
+        const std::uint32_t n = immediate ? (std::uint32_t)immediate : (std::uint32_t)g.equipLoadout;
+        if (!immediate) g.equipLoadout = 0;
         if (n > 224) { g.message |= kMsgEquip; return; }           // popp：寄存器原样
         const std::uintptr_t slot = SaveSlot();
         if (!slot) { g.message |= kMsgEquip; return; }
@@ -166,6 +222,8 @@ void Stop(Ctx* c, std::uintptr_t rax)
 
 void OnQuestLoad(Ctx* c)
 {
+    ActiveCall call;
+    if (!call) return;
     const std::uintptr_t o = c->rcx;
     const std::uintptr_t ui = Ui();
 
@@ -207,7 +265,7 @@ void OnQuestLoad(Ctx* c)
     const std::uintptr_t rbx = P(ui + 0x3C8);
     c->rbx = rbx;
     std::uint32_t qid = g.questId;
-    if (qid < 101 || qid > 67809) {                                    // Z：用上一次的任务
+    if (!gamedata::ValidQuestId((int)qid)) {                           // Z：用上一次的任务
         const std::uintptr_t last = P(ui + 0x3B8);
         c->rax = last;
         if (Rd<std::uint32_t>(last + 0x2B94) == 0xFFFFFFFF) { Stop(c, last); return; }
@@ -270,6 +328,9 @@ template <class T> bool PatchValue(std::uintptr_t a, T expect, T to, const char*
 } // namespace
 
 bool Ready() { return g_ready; }
+bool Enabled() { return g_enabled.load(std::memory_order_acquire); }
+
+int TakeEnteredQuest() { return g_enteredQuest.exchange(0); }
 
 bool Install(const Config& cfg, std::string& report)
 {
@@ -327,9 +388,12 @@ bool Install(const Config& cfg, std::string& report)
         static const std::uint8_t d2[] = {0xF7, 0x81, 0x98, 0x22, 0x00, 0x00, 0x11, 0x00, 0x00, 0x80};
         need(hook::InstallCtxHook(h1[0], 6, OnApplyResetAndEquip, d1, sizeof(d1)), "ApplyResetAndEquip", "装钩子失败");
         need(hook::InstallCtxHook(h2[0], 10, OnQuestLoad, d2, sizeof(d2)), "QuestLoad", "装钩子失败");
-        need(hook::InstallCallGate(kBaseLoad, &g.restart, 2, -1), "BaseLoad", "装钩子失败");
-        need(hook::InstallCallGate(kBaseLoad2, &g.restart, 2, 3), "BaseLoad2", "装钩子失败");
-        need(hook::InstallCallGate(kQuickLoad, &g.restart, 2, -1), "QuickLoad", "装钩子失败");
+        need(hook::InstallCallGate(kBaseLoad, &g.restart, 2, -1, &g_gateEnabled, &g_gateInflight),
+             "BaseLoad", "装钩子失败");
+        need(hook::InstallCallGate(kBaseLoad2, &g.restart, 2, 3, &g_gateEnabled, &g_gateInflight),
+             "BaseLoad2", "装钩子失败");
+        need(hook::InstallCallGate(kQuickLoad, &g.restart, 2, -1, &g_gateEnabled, &g_gateInflight),
+             "QuickLoad", "装钩子失败");
     } else {
         core = false;
         report += "·重开用到的代码和预期对不上：游戏版本不同，或者被别的模组改过"
@@ -367,13 +431,23 @@ bool Install(const Config& cfg, std::string& report)
     return core;
 }
 
+// 面板上「现在到底是哪份」按这套算：套装自己指定了就用套装的，否则用全局的。
+// 界面和实际写入都用这个，避免出现「显示的是 A，吃进去的是 B」。
 void ApplyOptions(const Config& cfg)
 {
+    // 禁用先关总闸并排空回调；启用则在所有选项发布完整之后最后开闸。
+    if (!cfg.enabled) SetEnabled(false);
     g.optReset = cfg.reset ? 1 : 0;
     g.optAcceptOnly = cfg.acceptOnly ? 1 : 0;
     g.optWyvern = cfg.wyvern ? 1 : 0;
     g.questId = (std::uint32_t)cfg.questId;   // 0 = 用上一次的任务（QuestLoad 里会去读）
     g.food = cfg.food;
+    // 当前套用的这套本身带了猫饭/任务的话，生效值就是它的那份（面板显示的也是这个）
+    if (const LoadoutSet* s = cfg.FindSetById(cfg.activeSet)) {
+        if (s->food > 0) g.food = s->food;
+        if (gamedata::ValidQuestId(s->quest)) g.questId = (std::uint32_t)s->quest;
+    }
+    if (cfg.enabled) SetEnabled(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -392,45 +466,15 @@ bool IsNumber(const std::string& s, int& v)
     return true;
 }
 
-// 在 [lo, hi) 里找以 \0 结尾、前面是 \0（或刚好在 4 字节边界）的 name
-std::uintptr_t FindName(std::uintptr_t lo, std::uintptr_t hi, const std::string& name)
-{
-    if (!Readable(lo, hi - lo)) return 0;
-    const char* p = reinterpret_cast<const char*>(lo);
-    const std::size_t n = name.size();
-    for (std::uintptr_t a = lo; a + n + 1 <= hi; ++a) {
-        const char* q = reinterpret_cast<const char*>(a);
-        if (q[0] != name[0] || std::memcmp(q, name.data(), n) != 0 || q[n] != '\0') continue;
-        if (a == lo || q[-1] == '\0') return a;
-    }
-    (void)p;
-    return 0;
-}
 } // namespace
 
+// 配置里存的就是编号：装备是「游戏里第几套」（1..224），道具是 "#存放格" 或显示编号。
+// 不是编号的一律当没配 —— 旧格式（0.7.1 及以前按名字存）不再解析。
 int ResolveEquip(const std::string& s)
 {
     int v = 0;
     if (IsNumber(s, v)) return (v >= 1 && v <= 224) ? v : 0;
-    const std::uintptr_t slot = SaveSlot();
-    if (!slot || s.empty()) return 0;
-    const std::uintptr_t w0 = slot + 0x10CCF4;
-    for (int n = 1; n <= 224; ++n) {
-        const std::uintptr_t w = w0 + std::uintptr_t(n - 1) * 0x2B0;
-        const char* name = reinterpret_cast<const char*>(w - 0x100);
-        if (Readable(w - 0x100, 0x100) && std::strncmp(name, s.c_str(), 0x100) == 0) {
-            Log("equip '%s' → %d（名字在武器字段前 0x100）", s.c_str(), n);
-            return n;
-        }
-    }
-    const std::uintptr_t a = FindName(w0 - 0x2B0, w0 + 224 * 0x2B0, s);
-    if (a) {
-        const long long off = (long long)a - (long long)w0;
-        Log("equip '%s' 不在预想位置；实际在 武器字段0 %+lld（= 第 %lld 格 %+lld）", s.c_str(),
-            off, off / 0x2B0 + 1, off % 0x2B0);
-    } else {
-        Log("equip '%s' 在装备套装表里没找到", s.c_str());
-    }
+    if (!s.empty()) Log("equip '%s' 不是编号，忽略（旧配置不再按名字解析）", s.c_str());
     return 0;
 }
 
@@ -471,27 +515,24 @@ int ItemStoreOfDisplay(std::uintptr_t slot, int d)
     return (d >= 1 && d <= 80) ? order[d - 1] + 1 : 0;
 }
 
-// 返回显示编号（套用命令要的就是它）。数字按游戏里看到的编号理解；名字先找存放格再换算。
+// 返回显示编号（套用命令要的就是它）。"#存放格" 是按玩家排过序也不会错的写法；
+// 数字按游戏里看到的编号理解；名字先找存放格再换算。
 int ResolveItem(const std::string& s)
 {
     int v = 0;
-    if (IsNumber(s, v)) return (v >= 1 && v <= 80) ? v : 0;
-    const std::uintptr_t slot = SaveSlot();
-    if (!slot || s.empty()) return 0;
-    std::uint8_t order[80];
-    ItemOrder(slot, order);
-    for (int st = 1; st <= 80; ++st) {
-        const std::uintptr_t a = ItemNameAt(slot, st);
-        if (!Readable(a, 0x100) || std::strncmp(reinterpret_cast<const char*>(a), s.c_str(), 0x100) != 0)
-            continue;
+    if (!s.empty() && s[0] == '#') {
+        const int st = std::atoi(s.c_str() + 1);
+        const std::uintptr_t slot = SaveSlot();
+        if (st < 1 || st > 80 || !slot) return 0;
+        std::uint8_t order[80];
+        ItemOrder(slot, order);
         for (int d = 1; d <= 80; ++d) {
-            if (order[d - 1] + 1 == st) {
-                Log("item '%s' → 存放第 %d 格 = 显示第 %d 号", s.c_str(), st, d);
-                return d;
-            }
+            if (order[d - 1] + 1 == st) return d;
         }
+        return 0;
     }
-    Log("item '%s' 在道具套装表里没找到", s.c_str());
+    if (IsNumber(s, v)) return (v >= 1 && v <= 80) ? v : 0;
+    Log("item '%s' 不是编号，忽略（旧配置不再按名字解析）", s.c_str());
     return 0;
 }
 
@@ -502,7 +543,64 @@ namespace {
 int g_pendingSetItem = 0;
 bool g_pendingLink = false;
 bool g_hasPendingLink = false;
-int g_savedRadial = -1;   // CT 的 wassetting：套道具前「联动快捷栏」原来的值
+int g_savedRadial = -1;                 // CT 的 wassetting：套道具前「联动快捷栏」原来的值
+std::uintptr_t g_savedRadialSlot = 0;    // 必须恢复到当时改过的同一个存档槽
+
+void RestoreRadial()
+{
+    if (g_savedRadial == -1) return;
+    if (g_savedRadialSlot)
+        Wr<std::uint8_t>(g_savedRadialSlot + 0x140415, (std::uint8_t)g_savedRadial);
+    g_savedRadial = -1;
+    g_savedRadialSlot = 0;
+}
+}
+
+void CancelPending()
+{
+    // 先由 SetEnabled(false) 阻止新回调，再等待已进入的回调退出，最后统一清空。
+    ::InterlockedExchange(reinterpret_cast<volatile LONG*>(&g.restart), 0);
+    g.optResetOnly = 0;
+    g.equipLoadout = 0;
+    g_pendingEquipApply.store(0, std::memory_order_release);
+    g_pendingSetItem = 0;
+    g_pendingLink = false;
+    g_hasPendingLink = false;
+    g.message = 0;
+    g_enteredQuest.exchange(0, std::memory_order_acq_rel);
+}
+
+void SetEnabled(bool enabled)
+{
+    if (enabled) {
+        if (g_enabled.load(std::memory_order_acquire)) return;
+        // 卸载期间发生的任务变化不应在重新装载时倒灌进配置；以当前值作为新基线。
+        const std::uintptr_t ui = game::Ui();
+        const std::uintptr_t last = ui ? game::P(ui + 0x3B8) : 0;
+        const int entered = last ? (int)game::Rd<std::uint32_t>(last + 0x2B94) : 0;
+        g_enteredSeen = gamedata::ValidQuestId(entered) ? entered : 0;
+        g_enteredQuest.store(0, std::memory_order_release);
+        ::InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_gateEnabled), 1);
+        g_enabled.store(true, std::memory_order_release);
+        return;
+    }
+    ::InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_gateEnabled), 0);
+    if (!g_enabled.exchange(false, std::memory_order_acq_rel)) {
+        while (::InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_gateInflight), 0, 0) != 0)
+            ::Sleep(0);
+        RestoreRadial();
+        CancelPending();
+        return;
+    }
+    // 先关闭两个入口闸门，再等待 C++ hook 与三个汇编 call gate 全部退出。
+    // call gate 的 inflight 覆盖比较、restart 写回和跳过决定，所以排空后再清零不会被复活。
+    ::InterlockedExchange(reinterpret_cast<volatile LONG*>(&g.restart), 0);
+    while (g_inflight.load(std::memory_order_acquire) != 0 ||
+           ::InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_gateInflight), 0, 0) != 0)
+        ::Sleep(0);
+    // 套道具时临时改过的快捷栏也在发布 Dormant 前恢复，并绑定原存档槽。
+    RestoreRadial();
+    CancelPending();
 }
 
 // 把一套全套里的装备/道具/猫饭/任务排进待办。装备由 ApplyResetAndEquip 钩子在游戏线程里换，
@@ -511,20 +609,38 @@ void QueueSet(const LoadoutSet& s)
 {
     const int e = ResolveEquip(s.equip);
     const int it = ResolveItem(s.item);
-    if (!s.equip.empty() && !e) Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：装备套装「%s」找不到",
-                                                       "Better-IN-Q: loadout \"%s\" not found",
-                                                       "Better-IN-Q：装備セット「%s」が見つかりません"), s.equip.c_str()));
-    if (!s.item.empty() && !it) Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：道具套装「%s」找不到",
-                                                       "Better-IN-Q: item loadout \"%s\" not found",
-                                                       "Better-IN-Q：アイテムセット「%s」が見つかりません"), s.item.c_str()));
+    if (!s.equip.empty() && !e) Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：装备套装「%s」找不到（旧版按名字存的请在套装页重选）",
+                                                       "Better-IN-Q: loadout \"%s\" not found (old name-based configs need re-picking)",
+                                                       "Better-IN-Q：装備セット「%s」が見つかりません（旧形式の設定は選び直してください）"), s.equip.c_str()));
+    if (!s.item.empty() && !it) Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：道具套装「%s」找不到（旧版按名字存的请在套装页重选）",
+                                                       "Better-IN-Q: item loadout \"%s\" not found (old name-based configs need re-picking)",
+                                                       "Better-IN-Q：アイテムセット「%s」が見つかりません（旧形式の設定は選び直してください）"), s.item.c_str()));
     if (e) g.equipLoadout = e;
     if (it) { g_pendingSetItem = it; g_pendingLink = s.linkRadial; g_hasPendingLink = true; }
-    if (s.food) g.food = s.food;
-    if (s.quest > 100 && s.quest < 67809) g.questId = (std::uint32_t)s.quest;
+    if (s.food > 0) g.food = s.food;
+    if (gamedata::ValidQuestId(s.quest)) g.questId = (std::uint32_t)s.quest;
+}
+
+bool RequestEquipApply(const Config& cfg, const std::string& equip)
+{
+    // 和 SetEnabled(false) 共用 inflight 闸门：停用会等发布者退出后再清队列，
+    // 不会出现检查 Enabled 后恰好进入 Dormant、随后又发布旧请求的竞态。
+    ActiveCall call;
+    if (!call || !cfg.enabled || !g_ready) return false;
+    const int n = equip.empty() ? 0 : ResolveEquip(equip);
+    g_pendingEquipApply.store(n, std::memory_order_release);
+    return equip.empty() || n != 0;
+}
+
+bool RequestActiveSetEquipApply(const Config& cfg)
+{
+    const LoadoutSet* s = cfg.activeSet > 0 ? cfg.FindSetById(cfg.activeSet) : nullptr;
+    return RequestEquipApply(cfg, s ? s->equip : std::string());
 }
 
 void RequestRestart(const Config& cfg)
 {
+    if (!cfg.enabled || !Enabled()) return;
     if (!g_ready) {
         Chat(i18n::Tr("Better-IN-Q：重开功能没装上，详情见 BetterINQ.log",
                       "Better-IN-Q: the restart hook did not install, see BetterINQ.log",
@@ -532,7 +648,9 @@ void RequestRestart(const Config& cfg)
         return;
     }
     if (g.restart != 0) return;
-    if (cfg.activeSet != 0) {
+    // 重开将按当前 Active 配置排队，不能在重开完后再补套旧的面板选择。
+    g_pendingEquipApply.store(0, std::memory_order_release);
+    if (cfg.activeSet > 0) {
         if (const LoadoutSet* s = cfg.FindSetById(cfg.activeSet)) QueueSet(*s);
         else Chat(i18n::Fmt(i18n::Tr("Better-IN-Q：配置里没有编号 %d 的全套",
                                      "Better-IN-Q: no loadout #%d in the config",
@@ -545,6 +663,7 @@ void RequestRestart(const Config& cfg)
 // 不接任务也不出发。不套用全套配置 —— 这一趟只是把任务清掉。
 void RequestResetOnly()
 {
+    if (!Enabled()) return;
     if (!g_ready) {
         Chat(i18n::Tr("Better-IN-Q：重开功能没装上，详情见 BetterINQ.log",
                       "Better-IN-Q: the restart hook did not install, see BetterINQ.log",
@@ -566,7 +685,7 @@ std::vector<NamedLoadout> ListEquipLoadouts()
         if (!Readable(w - 0x100, 0x104) || Rd<std::uint32_t>(w) == 0xFFFFFFFF) continue;   // 空格子
         char name[0x101] = {};
         std::memcpy(name, reinterpret_cast<const void*>(w - 0x100), 0x100);
-        r.push_back({n, name[0] ? std::string(name) : std::string(i18n::Tr("装备套装 ", "Equip loadout ", "装備セット ")) + std::to_string(n)});
+        r.push_back({n, name[0] ? std::string(name) : std::string(i18n::Tr("装备套装 ", "Equip loadout ", "装備セット ")) + std::to_string(n), n});
     }
     return r;
 }
@@ -584,9 +703,39 @@ std::vector<NamedLoadout> ListItemLoadouts()
         const std::uintptr_t a = ItemNameAt(slot, st);
         char name[0x101] = {};
         if (Readable(a, 0x100)) std::memcpy(name, reinterpret_cast<const void*>(a), 0x100);
-        r.push_back({d, name[0] ? std::string(name) : std::string(i18n::Tr("道具套装 ", "Item loadout ", "アイテムセット ")) + std::to_string(d)});
+        r.push_back({d, name[0] ? std::string(name) : std::string(i18n::Tr("道具套装 ", "Item loadout ", "アイテムセット ")) + std::to_string(d), st});
     }
     return r;
+}
+
+// 原版 IN-Q 的 config.txt 里，装备/道具存的是名字（它自己也只会按名字找）；
+// 我们存编号。导入之后用当前存档里的名单把名字换成编号，换不到的留空并报告，
+// 绝不写一个看着像编号、其实指向别的套装的数字。
+int NormalizeEquipItemNumbers(Config& cfg)
+{
+    int lost = 0;
+    const int changed = ::MigrateLoadoutRefs(cfg, ListEquipLoadouts(), ListItemLoadouts(), &lost);
+    if (changed || lost) Log("import: 装备/道具名字换编号，改了 %d 处，%d 处对不上已留空", changed, lost);
+    return lost;
+}
+
+// 老配置一次性迁移：0.7.1 及以前面板把装备/道具套装按名字存进 ini，删掉读取兼容之后
+// 这些值就没人认识了。进存档后（拿得到名单）换一次编号，调用方存回 profile 即可。
+int MigrateLoadoutRefs(Config& cfg)
+{
+    if (!::NeedsLoadoutMigration(cfg)) return 0;
+    const std::vector<NamedLoadout> eq = ListEquipLoadouts();
+    const std::vector<NamedLoadout> it = ListItemLoadouts();
+    if (eq.empty() && it.empty()) {
+        Log("config: 还没读到存档里的套装列表，稍后再把老格式的套装引用换成编号");
+        return 0;
+    }
+    int lost = 0;
+    const int changed = ::MigrateLoadoutRefs(cfg, eq, it, &lost);
+    if (changed)
+        Log("config: 老格式的套装引用换成编号，改了 %d 处，%d 处对不上已留空（旧名字请在套装页重选）",
+            changed, lost);
+    return changed;
 }
 
 // ---------------------------------------------------------------------------
@@ -602,12 +751,10 @@ void Tick(const Config& cfg)
     const std::uintptr_t piui = P(pui + 0x170);
     const std::uintptr_t slot = SaveSlot();
 
-    // 上一拍为套道具临时改的「联动快捷栏」，这一拍改回去。只动 1 个字节：
+    // 上一拍为套道具临时改的「联动快捷栏」，这一拍改回原存档槽。只动 1 个字节：
     // CT 按 4 字节读写这个奇数偏移，会把后面 3 个字节一起覆盖成 0。
-    if (g_savedRadial != -1 && slot) {
-        Wr<std::uint8_t>(slot + 0x140415, (std::uint8_t)g_savedRadial);
-        g_savedRadial = -1;
-    }
+    RestoreRadial();
+    if (!cfg.enabled || !Enabled()) return;
 
     // 道具套装（通过 UI 命令让游戏自己套用）
     if (g_pendingSetItem > 0 && slot && piui) {
@@ -618,6 +765,7 @@ void Tick(const Config& cfg)
         if (valid != 0) {
             if (g_hasPendingLink) {
                 g_savedRadial = Rd<std::uint8_t>(slot + 0x140415);
+                g_savedRadialSlot = slot;
                 Wr<std::uint8_t>(slot + 0x140415, g_pendingLink ? 1 : 2);
                 g_hasPendingLink = false;
             }
@@ -642,15 +790,27 @@ void Tick(const Config& cfg)
         }
     }
 
-    // 猫饭：读盘期间把猫饭结构写成预设（CT：pfood+19A4+i*4，i=1..8）
-    if (g.food > 0 && pload && Rd<std::uint32_t>(pload + 0x1D04) != 0) {
-        auto it = cfg.foods.find((int)g.food);
+    // 猫饭：只在明确选中预设时于读盘期间写入（CT：pfood+19A4+i*4，i=1..8）。
+    // 未选（0/-1）不覆盖；数值相同不能证明是我们写的，也可能是玩家手动吃的。
+    if (pload && Rd<std::uint32_t>(pload + 0x1D04) != 0) {
         const std::uintptr_t pf = P(pFood);
-        if (it != cfg.foods.end() && pf) {
+        auto it = cfg.foods.find((int)g.food);
+        if (pf && g.food > 0 && it != cfg.foods.end()) {
             const FoodPreset& f = it->second;
             const std::int32_t v[8] = {f.hp, f.stamina, f.attack, f.defense, f.elemRes,
                                        f.skill[0], f.skill[1], f.skill[2]};
             for (int i = 0; i < 8; ++i) Wr<std::int32_t>(pf + 0x19A8 + i * 4, v[i]);
+        }
+    }
+
+    // 全局任务跟着「实际进去了的那一关」走。游戏把最后一次进的任务记在 pui+0x3B8 的 +0x2B94，
+    // 我们重开的、玩家自己在柜台接的都会更新 —— 发现变了就交给主循环写进全局任务。
+    // （不能只在「取消套用」那一刻改：那时玩家可能已经又打了别的关。）
+    if (const std::uintptr_t last = P(pui + 0x3B8)) {
+        const std::uint32_t entered = Rd<std::uint32_t>(last + 0x2B94);
+        if (gamedata::ValidQuestId((int)entered) && (int)entered != g_enteredSeen) {
+            g_enteredSeen = (int)entered;
+            g_enteredQuest.store((int)entered);
         }
     }
 

@@ -21,9 +21,12 @@ struct Callbacks {
 bool Install(const Callbacks& cb, std::string& err);
 void SetOpen(bool open);
 void SetImeEnabled(bool on);   // 排查用：关掉输入法接管
+void SetWndHook(bool on);      // 排查用：不接管游戏窗口过程（[Debug] NoWndHook）
+// Wrapped window callbacks remain forwarding-only until window destruction;
+// the DLL must stay loaded while another overlay can still call our callback.
 void Shutdown(bool processExiting = false);
-void ShutdownForExit();   // 游戏要退出了：只还原窗口过程，D3D/ImGui 一律不碰
-bool WindowGone();   // 游戏窗口已经销毁（用来让后台线程自己退出）          // DLL 卸载：还掉我们攥着的引用、还原窗口过程
+void ShutdownForExit();   // 停止面板、放开部分游戏引用；保留窗口消息转发链
+bool WindowGone();   // 游戏窗口已经销毁（用来让后台线程自己退出）
 const char* Stage();      // 崩溃诊断：当前在哪个钩子里
 bool IsOpen();
 bool Failed();   // 渲染端初始化失败（比如游戏开的是 DX12），面板不可用；这时 IsOpen() 一直是 false

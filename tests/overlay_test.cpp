@@ -153,6 +153,27 @@ int wmain(int argc, wchar_t** argv)
     }
     CHECK(g_opened == 1 && g_draws == 6, "打开后每帧都画（opened=%d draws=%d）", g_opened, g_draws);
 
+    // 关闭再打开之间没有 Present：必须按新打开周期回调并先门控唤出 A/B。
+    {
+        const int openedBefore = g_opened;
+        ui::DebugGo(6, 0);
+        g_model.reqRestart = g_model.reqClose = false;
+        overlay::SetOpen(false);
+        overlay::SetOpen(true);
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_GamepadFaceDown, true);
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_GamepadFaceRight, true);
+        frame(0.25f, 0.35f, 0.25f);
+        CHECK(g_opened == openedBefore + 1 && ui::DebugPage() == 0,
+              "两次 Present 间快速关闭重开仍触发 opened 并回主页（%d → %d）", openedBefore, g_opened);
+        CHECK(!ImGui::GetKeyData(ImGuiKey_GamepadFaceDown)->Down &&
+              !ImGui::GetKeyData(ImGuiKey_GamepadFaceRight)->Down &&
+              !g_model.reqRestart && !g_model.reqClose,
+              "快速重开已 Arm 门控：唤出 A/B 不会重开任务或关闭面板");
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_GamepadFaceDown, false);
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_GamepadFaceRight, false);
+        frame(0.25f, 0.35f, 0.25f);
+    }
+
     // 看样子用：设置页拉到底（快捷键那几格），以及从设置页切回主页途中的一帧
     ui::DebugGo(6, 0);
     for (int i = 0; i < 20; ++i) frame(0.25f, 0.35f, 0.25f);

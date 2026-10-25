@@ -17,8 +17,16 @@ namespace profile {
 // 插件目录（带结尾反斜杠），要在 Worker 里、读配置之前调一次
 void Init(const std::wstring& pluginDir);
 
-// SteamID64 的十进制字符串；拿不到时是空串
+// SteamID64：优先经过进程校验的 ActiveUser，其次唯一 MostRecent，最后无歧义 userdata。
+// 注册表/VDF 是 Steam 的本地状态而非 Steamworks 身份证明；拿不到时是空串。
 const std::string& SteamId();
+
+namespace detail {
+// 纯函数：不访问注册表/文件，便于隔离测试。userdataAccounts 是有本游戏目录的账号 ID。
+// malformed/冲突的登录记录拒绝猜测；多 userdata 账号不按目录时间挑选。
+std::string SelectSteamId(unsigned long activeAccount, const std::string& loginUsers,
+                          const std::vector<std::string>& userdataAccounts);
+}  // namespace detail
 
 // 面板上显示的账号：SteamID64，拿不到就写「未知」
 std::string AccountLabel();

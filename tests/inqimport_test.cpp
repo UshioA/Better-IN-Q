@@ -138,7 +138,7 @@ int main()
 
     // 猫饭：Meal=0 是「体力+50,耐力+50」，Meal=1 是「猫饭无效」；
     // Status UP 是字节偏移（4=攻 / 8=防 / 12=属耐），写进游戏的档位只有「大」
-    CHECK(cfg.sets.size() == 4 && cfg.sets[2].food == 0, "Meal=1（猫饭无效）不建猫饭");
+    CHECK(cfg.sets.size() == 4 && cfg.sets[2].food == -1, "Meal=1（猫饭无效）不建猫饭");
     {
         const FoodPreset& f0 = cfg.foods.at(cfg.sets[0].food);   // 综合套装1：Meal 0 / Status 4
         CHECK(f0.hp == 5 && f0.stamina == 2, "Meal=0 → 体力+50 / 耐力+50（%d/%d）", f0.hp, f0.stamina);
@@ -160,8 +160,13 @@ int main()
     {
         Config c;
         LoadoutSet oldSet;
+        oldSet.id = 1; // Import reuses 1: existence checking must not retain this selection.
         oldSet.name = "旧的全套";
         c.sets.push_back(oldSet);
+        c.activeSet = 1;
+        c.foods[1] = FoodPreset();
+        c.food = 1;
+        c.foodOrder = {1, 7};
         c.foods[7] = FoodPreset();
         std::string notes2;
         const int n2 = inqimport::Import(file, c, err, &notes2);
@@ -169,6 +174,12 @@ int main()
         CHECK(c.FindSet("旧的全套") == nullptr, "原来的全套被顶掉了");
         CHECK(c.foods.find(7) == c.foods.end(), "原来的猫饭也被顶掉了");
         CHECK(c.foods.size() == 3, "重导也不会多出来（%zu 份）", c.foods.size());
+        CHECK(c.FindSetById(1) && c.foods.count(1), "import reissues old IDs to unrelated data");
+        CHECK(c.activeSet == -1 && c.food == -1 && c.foodOrder.empty(), "replacement clears selections even when IDs are reused");
+        c.activeSet = c.sets[2].id;
+        c.food = c.sets[0].food;
+        CHECK(inqimport::Import(file, c, err, nullptr) == 4 && c.activeSet == -1 && c.food == -1,
+              "repeated replacement never silently selects a reissued ID");
     }
 
     // ---- 手柄组合当面板键：不影响导入，也不报提示 ----
@@ -220,7 +231,7 @@ int main()
             CHECK(!c3.foods.empty(), "真实文件建了猫饭（%zu 份）", c3.foods.size());
             CHECK(c3.FindSet("综合套装1") != nullptr, "找到「综合套装1」");
             const LoadoutSet* s4 = c3.FindSet("综合套装4");
-            CHECK(s4 && s4->food == 0, "真实文件里 Meal=1 的「综合套装4」没有猫饭");
+            CHECK(s4 && s4->food == -1, "真实文件里 Meal=1 的「综合套装4」没有猫饭");
             const LoadoutSet* s1 = c3.FindSet("综合套装1");
             CHECK(s1 && s1->food && c3.foods.at(s1->food).hp == 5 && c3.foods.at(s1->food).attack == 3,
                   "真实文件里 Meal=0 + Status UP=4 → 体力+50 且攻击 Up");

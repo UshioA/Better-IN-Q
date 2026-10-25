@@ -8,7 +8,7 @@ plugin: it is loaded with the game, and `Insert` opens the panel.
 1. Install Stracker's Loader first: `dinput8.dll` and `loader.dll` must be in the game folder.
    Mod managers only copy files; without the loader the plugin is never loaded.
 2. Merge the `nativePC` folder from the archive into the game folder.
-3. Start the game; when you are back at a hub, the chat box shows "Better-IN-Q 0.7.1 已就绪".
+3. Start the game; when you are back at a hub, the chat box shows "Better-IN-Q 0.7.2 已就绪".
 
 Uninstall: delete `nativePC\plugins\BetterINQ` (settings live there too).
 Do not run the original IN-Q.exe at the same time.

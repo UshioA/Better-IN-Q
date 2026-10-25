@@ -145,27 +145,71 @@ bool InstallCtxHook(std::uintptr_t site, std::size_t len, Handler h,
 }
 
 bool InstallCallGate(std::uintptr_t site, volatile std::int32_t* flag,
-                     std::int32_t skipWhen, std::int32_t setOnSkip)
+                     std::int32_t skipWhen, std::int32_t setOnSkip,
+                     volatile std::int32_t* enabled, volatile std::int32_t* inflight)
 {
     const std::uint8_t* s = reinterpret_cast<const std::uint8_t*>(site);
     if (s[0] != 0xE8) return false;
+    if ((enabled == nullptr) != (inflight == nullptr)) return false;
     std::int32_t rel = 0;
     std::memcpy(&rel, s + 1, 4);
     const std::uintptr_t target = site + 5 + (std::intptr_t)rel;
     if (skipWhen < -128 || skipWhen > 127) return false;
 
-    Emitter e(64);
+    Emitter e(160);
     e.b({0x50});                                                         // push rax
+    if (enabled) {
+        e.b({0x48, 0xB8}).u64(reinterpret_cast<std::uint64_t>(inflight)); // mov rax, inflight
+        e.b({0xF0, 0xFF, 0x00});                                        // lock inc dword [rax]
+        e.b({0x48, 0xB8}).u64(reinterpret_cast<std::uint64_t>(enabled));  // mov rax, enabled
+        e.b({0x83, 0x38, 0x00});                                        // cmp dword [rax], 0
+        e.b({0x74, 0x00});                                               // je inactive（稍后补 rel8）
+    }
     e.b({0x48, 0xB8}).u64(reinterpret_cast<std::uint64_t>(flag));        // mov rax, flag
     e.b({0x83, 0x38, std::uint8_t(skipWhen)});                           // cmp dword [rax], skipWhen
     if (setOnSkip >= 0) {
         e.b({0x75, 0x06});                                               // jne +6
-        e.b({0xC7, 0x00}).u32((std::uint32_t)setOnSkip);                 // mov dword [rax], setOnSkip
-    }                                                                    // （mov 不动标志位）
+        e.b({0xC7, 0x00}).u32((std::uint32_t)setOnSkip);                 // mov dword [flag], setOnSkip（不改 flags）
+    }
+    e.b({0x0F, 0x94, 0xC0});                                            // sete al（写回后才可复用 rax 低字节）
+    if (inflight) {
+        e.b({0x50});                                                     // push rax（保存 0/1 结果）
+        e.b({0x48, 0xB8}).u64(reinterpret_cast<std::uint64_t>(inflight)); // mov rax, inflight
+        e.b({0xF0, 0xFF, 0x08});                                        // lock dec dword [rax]
+        e.b({0x58});                                                     // pop rax
+    }
+    e.b({0x84, 0xC0});                                                   // test al,al
     e.b({0x58});                                                         // pop rax
-    e.b({0x74, 0x10});                                                   // je skip（跳过下面 16 字节）
+    e.b({0x75, 0x10});                                                   // jne skip（跳过下面 16 字节）
     e.callAbs(target);                                                   // call 原目标
     e.jmpAbs(site + 5);                                                  // skip: 回去
+
+    if (enabled) {
+        // inactive: 已登记 inflight，但 enabled 为 0；退出登记后一定调用游戏原函数。
+        Emitter tail(48);
+        tail.b({0x48, 0xB8}).u64(reinterpret_cast<std::uint64_t>(inflight)); // mov rax, inflight
+        tail.b({0xF0, 0xFF, 0x08});                                     // lock dec dword [rax]
+        tail.b({0x58});                                                  // pop rax
+        tail.callAbs(target);
+        tail.jmpAbs(site + 5);
+
+        std::vector<std::uint8_t> bytes = e.bytes();
+        const std::size_t inactive = bytes.size();
+        std::size_t jeDisp = bytes.size();
+        for (std::size_t i = 0; i + 1 < bytes.size(); ++i) {
+            if (bytes[i] == 0x74 && bytes[i + 1] == 0x00) { jeDisp = i + 1; break; }
+        }
+        if (jeDisp == bytes.size()) return false;
+        const std::size_t afterJe = jeDisp + 1;
+        if (inactive - afterJe > 127) return false;
+        bytes[jeDisp] = static_cast<std::uint8_t>(inactive - afterJe);
+        bytes.insert(bytes.end(), tail.bytes().begin(), tail.bytes().end());
+        Emitter joined(bytes.size());
+        joined.raw(bytes.data(), bytes.size());
+        const std::uintptr_t stub = Commit(joined);
+        return stub && PatchJump(site, 5, stub);
+    }
+
     const std::uintptr_t stub = Commit(e);
     return stub && PatchJump(site, 5, stub);
 }

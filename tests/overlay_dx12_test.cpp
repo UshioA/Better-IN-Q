@@ -10,7 +10,8 @@
 #include <string>
 
 #include "../src/config.h"
-#include "../src/overlay.h"
+// Include the implementation to assert renderer lifetime invariants during replacement.
+#include "../src/overlay.cpp"
 #include "../src/ui.h"
 #include "../src/i18n.h"
 
@@ -240,16 +241,60 @@ int wmain(int argc, wchar_t** argv)
     CHECK(g_draws == before + 20 && g_shotOk && g_litPixels > 200, "改分辨率后照常画（draws +%d，金色像素 %d）",
           g_draws - before, g_litPixels);
 
+    // A new format/device must invalidate this frame and rebuild before drawing again.
+    // A second HWND allows both real swap chains to remain alive; substitute only
+    // the window identity to exercise the same-window replacement branch.
+    HWND hw2 = CreateWindowExW(0, wc.lpszClassName, L"MHW DX12 replacement", WS_OVERLAPPEDWINDOW,
+                               0, 0, 1280, 720, nullptr, nullptr, wc.hInstance, nullptr);
+    IDXGISwapChain1* replacement = nullptr;
+    sd.Width = 1280; sd.Height = 720;
+    sd.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    hr = fac->CreateSwapChainForHwnd(queue, hw2, &sd, nullptr, nullptr, &replacement);
+    CHECK(SUCCEEDED(hr) && replacement, "replacement swap chain created");
+    if (!replacement) return 1;
+    WaitQueue(queue);
+    overlay::g_hwnd = hw2;
+    CHECK(!overlay::IsGameSwapChain(replacement), "replacement frame cannot render after backend teardown");
+    CHECK(!overlay::g_inited && !ImGui::GetCurrentContext() && !overlay::g_queue.load(),
+          "replacement invalidates context, readiness and captured queue together");
+    CHECK(!overlay::g_srvHeap && !overlay::g_rtvHeap && !overlay::g_fenceEvent && overlay::g_srvFree.empty(),
+          "replacement releases renderer-owned descriptors and synchronization state");
+    sc->Release(); sc1->Release();
+    sc1 = replacement;
+    sc = nullptr;
+    sc1->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&sc));
+    const int beforeRebuild = g_draws;
+    for (int i = 0; i < 8; ++i) frame();
+    CHECK(!overlay::Failed() && overlay::g_inited && g_draws > beforeRebuild,
+          "replacement recaptures queue and resumes drawing without reopening panel");
+    CHECK(overlay::g_srvFree.size() <= 64 && overlay::g_fenceVal > 0,
+          "replacement resets descriptor allocator and fence generation");
+
     overlay::SetOpen(false);
     const int closed = g_draws;
     for (int i = 0; i < 5; ++i) frame();
     CHECK(g_draws == closed, "关掉后不再画");
+
+    // 退出收尾（「窗口销毁了但进程不退」走的就是这条路）：我们自己建的东西必须全放掉，
+    // 而且不能再碰窗口过程 —— 窗口已经没了，跨线程 SetWindowLongPtrW 只会等死。
+    overlay::ShutdownForExit();
+    CHECK(overlay::g_dead.load() && !overlay::g_inited.load() && !ImGui::GetCurrentContext(),
+          "exit teardown marks the overlay dead and destroys the context");
+    CHECK(!overlay::g_list && !overlay::g_fence && !overlay::g_fenceEvent && !overlay::g_sc3 &&
+          !overlay::g_rtvHeap && !overlay::g_srvHeap && overlay::g_srvFree.empty(),
+          "exit teardown releases every renderer-owned D3D12 object");
+    CHECK(!overlay::g_queue.load() && overlay::g_alloc[0] == nullptr,
+          "exit teardown drops the borrowed queue and the command allocators");
+    const int afterExit = g_draws;
+    for (int i = 0; i < 4; ++i) frame();
+    CHECK(g_draws == afterExit, "退出收尾之后 Present 只转发，不再往画面上画");
 
     WaitQueue(queue);
     cl->Release();
     for (auto& a : al) a->Release();
     rtvHeap->Release();
     sc->Release(); sc1->Release(); fence->Release(); queue->Release(); dev->Release(); warp->Release(); fac->Release();
+    DestroyWindow(hw2);
     DestroyWindow(hw);
     std::printf("\n%s（%d 项失败）\n", g_fail ? "有失败" : "全部通过", g_fail);
     return g_fail ? 1 : 0;

@@ -16,6 +16,7 @@ namespace ui {
 struct LoadoutName {
     int number;          // 游戏里的编号（道具 = 列表显示编号；装备 = 存放格）
     std::string name;
+    int store = 0;       // 道具套装的存放格（跟显示编号可能不同）；装备与 number 相同
 };
 
 // 面板和外界只通过它打交道。Draw 在渲染线程里调用，调用方持锁。
@@ -30,6 +31,7 @@ struct Model {
 
     bool reqRestart = false;              // 立刻重开（接任务 → 出发）
     bool reqResetOnly = false;            // 只重置任务：回据点，不接任务也不出发
+    bool reqApplyEquip = false;           // 显式套用/取消/编辑当前装备：主循环排队换装，不重开
     bool reqSave = false;
     int slot = 1;                         // 设置页里选的存档位（1..3）
     bool reqSlot = false;                 // 玩家切了存档位，要换配置                 // 配置改了，存盘并生效
@@ -45,7 +47,7 @@ struct Model {
 
 // ImGui 上下文建好后调一次。scale = 屏幕高度 / 1080。
 void Init(float scale);
-// 每次打开面板时调：回到主页、焦点放在「重开」上
+// 每次打开面板时调：退出列表移动 / 录键模式，回到主页、焦点放在「重开」上
 void OnOpen(Model& m);
 // 每帧
 void Draw(Model& m, float screenW, float screenH);
@@ -54,6 +56,9 @@ void Draw(Model& m, float screenW, float screenH);
 void DebugGo(int page, int editIndex);
 // 测试用：当前在哪一页（同上编号），焦点是不是在左侧栏
 int DebugPage();
+
+// 猫饭页列表里当前会出现哪些编号（含「删掉但还有人在用」的那几份，按显示顺序）
+std::vector<int> FoodRowIds(const Config& c);
 // 上一个测试帧里套装/猫饭列表的滚动位置（用来确认移动模式会滚列表）
 bool DebugSidebarFocused();
 int DebugSidebarFocusIndex();   // 这一帧焦点在侧栏第几格（-1 = 不在侧栏）
@@ -63,6 +68,13 @@ void DebugStartCapture(Model& m, int row, bool pad);
 std::string DebugCaptureWhy();
 // 预览 / 宣传图用：往「换任务」的搜索框里填字
 void DebugSetSearch(const char* text);
+void DebugFocusClearAll();
+void DebugFocusState();
+void DebugRadioInfo(unsigned long long& id, int& focused, unsigned long long& nav);
+void DebugIds(unsigned long long& back, unsigned long long& r0, unsigned long long& r1);
+const char* DebugNavWindowName();
+void DebugWindowInfo(int& navwin_h, int& clip_h);         // 测试用：把焦点放到设置页的「插件状态」单选上      // 测试用：把焦点放到设置页的「清空」按钮
+int DebugClearStage();          // 两级确认走到第几层（0 = 没弹）
 // 预览用：直接弹出「选原版 config.txt」的选择框 / 关掉它
 void DebugOpenPick();
 void DebugClosePick();

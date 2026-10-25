@@ -1,4 +1,4 @@
-﻿﻿﻿# ============================================================================
+﻿# ============================================================================
 #  Better-IN-Q —— 用 MSVC（Visual Studio 2022 / Build Tools 都行）构建，不需要 MinGW。
 #    powershell -ExecutionPolicy Bypass -File build.ps1 [dll|test|all]   默认 all
 #  产物：out\BetterINQ.dll
@@ -88,7 +88,7 @@ if ($What -eq "dll" -or $What -eq "all") {
     Build-ImGui
     $srcs = @("main", "inq", "hook", "config", "input", "log",
               "ui", "gamedata", "overlay", "padfilter", "cursorfilter", "kbdfilter", "dinfilter",
-              "hdr", "inqimport", "profile",
+              "hdr", "inqimport", "profile", "hangdump",
               "i18n") |
             ForEach-Object { Join-Path $Src "$_.cpp" }
     Compile ($Common + @("/LD", "/I$IM", "/Isrc", "/Fe$Out\BetterINQ.dll", "/Fo$Obj\") +
@@ -166,14 +166,32 @@ if ($What -eq "test" -or $What -eq "all") {
         $ImGuiObjs + @("/link") + $D3D11 + $WinLibs + @("windowscodecs.lib", "xinput.lib"))
 
     Compile ($Common + @("/Fo$Obj\", "/I$IM", "/Isrc", "/Fe$Out\overlay_dx12_test.exe",
-        "$Tests\overlay_dx12_test.cpp", "$Src\overlay.cpp", "$Src\hdr.cpp", "$Src\ui.cpp", "$Src\gamedata.cpp",
+        "$Tests\overlay_dx12_test.cpp", "$Src\hdr.cpp", "$Src\ui.cpp", "$Src\gamedata.cpp",
         "$Src\config.cpp", "$Src\input.cpp", "$Src\padfilter.cpp", "$Src\log.cpp", "$Src\hook.cpp",
         "$Src\i18n.cpp") +
         $ImGuiObjs + @("/link") + @("d3d12.lib") + $D3D11 + $WinLibs + @("windowscodecs.lib"))
 
+    Compile ($Common + @("/Fo$Obj\", "/I$IM", "/Isrc", "/Fe$Out\window_chain_test.exe",
+        "$Tests\window_chain_test.cpp", "$Src\hdr.cpp", "$Src\log.cpp", "$Src\i18n.cpp", "$Src\hangdump.cpp") +
+        $ImGuiObjs + @("/link", "d3d12.lib") + $D3D11 + $WinLibs)
+
+    Compile ($Common + @("/Fo$Obj\", "/I$IM", "/Isrc", "/Fe$Out\ime_test.exe",
+        "$Tests\ime_test.cpp", "$Src\hdr.cpp", "$Src\log.cpp", "$Src\i18n.cpp") +
+        $ImGuiObjs + @("/link", "d3d12.lib") + $D3D11 + $WinLibs)
+
+    Compile ($Common + @("/Fo$Obj\", "/Isrc", "/Fe$Out\runtime_state_test.exe",
+        "$Tests\runtime_state_test.cpp") + @("/link"))
+
+    Compile ($Common + @("/Fo$Obj\", "/Isrc", "/Fe$Out\inq_equip_apply_test.exe",
+        "$Tests\inq_equip_apply_test.cpp", "$Src\config.cpp", "$Src\gamedata.cpp", "$Src\i18n.cpp", "$Src\hook.cpp") +
+        @("/link") + $WinLibs)
+
+    Compile ($Common + @("/Fo$Obj\", "/I$IM", "/Isrc", "/Fe$Out\panel_gamepad_gate_test.exe",
+        "$Tests\panel_gamepad_gate_test.cpp") + $ImGuiCore + @("/link") + $WinLibs)
+
     $fail = 0
     foreach ($t in @("hook_test", "gamedata_test", "config_test", "cursor_test", "kbdfilter_test", "hdr_test", "profile_test", "inqimport_test",
-                     "dinfilter_test", "ui_nav_test")) {
+                     "dinfilter_test", "ui_nav_test", "window_chain_test", "ime_test", "runtime_state_test", "inq_equip_apply_test", "panel_gamepad_gate_test")) {
         Write-Host "  run $t.exe"
         & (Join-Path $Out "$t.exe")
         if ($LASTEXITCODE -ne 0) { $fail = $fail + 1 }

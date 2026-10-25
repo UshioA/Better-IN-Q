@@ -1,127 +1,247 @@
-Better-IN-Q v0.7.1
-==================
+Better-IN-Q v0.7.2
+面板操作说明 / Panel Guide
+=========================
 
-怪物猎人：世界 冰原（15.23.00）的快速重开工具，做成了游戏插件：
-开游戏就在，不用另外开软件；按 Insert 在游戏里呼出面板。
+中文
+====
 
-
-■ 安装
-------
-1) 先装 Stracker's Loader：游戏根目录里要有 dinput8.dll 和 loader.dll。
-   狩技盒子只负责拷文件，不带这个前置；没装的话插件不会被加载。
-2) 把压缩包里的 nativePC 文件夹整个合并进游戏目录。
-3) 进游戏、回到据点时，聊天框会出现「Better-IN-Q 0.7.1 已就绪」。
-
-卸载：删掉 nativePC\plugins\BetterINQ 这个文件夹就行（配置也在里面，想留着先备份）。
-不要和原版 IN-Q.exe 同时开，两个会抢同一批挂钩点。
-
-
-■ 基本操作
-----------
-重开任务     手柄 LB+RB+LT+RT
-打开面板     键盘 Insert（面板只能用键盘开）
-只重置任务   面板主页的「只重置任务」按钮；想设快捷键就到设置页第三行去录
-
-面板里：
-  十字键 / 左摇杆   移动
-  A                 确认
-  B                 返回（在主页面按 B 就是关面板）
-  往左               到头后进左侧栏，上下切页，往右回到内容
-
-打开面板时焦点就在「重开」上，直接按 A 就重开。
-面板开着的时候，游戏收不到键盘、鼠标和手柄；鼠标可以自由移动去点面板。
-
-
-■ 任务页
---------
-上面显示当前要重开的任务，下面是「重开」和「只重置任务」两个按钮。
-「换任务」按分组列出全部任务，搜索框支持：
-  · 任务名：中文、英文、日文都行
-  · 中文拼音和首字母：heilong、chuanshuo、hl
-  · 日文假名和罗马音：でんせつ、densetsu、kokuryuu
-  · 任务 ID：直接打数字
-选中一条就是下次重开要接的任务。
-
-
-■ 套装页
---------
-「全套」= 装备套装 + 道具套装 + 猫饭 + 任务，重开时一起套上。
-装备套装、道具套装都直接从你游戏里的套装列表里选；下拉选「—」表示这一项不换。
-列表里：
-  · 按 A / 空格 / 回车：还没在用的那一套 → 直接设为本次要用的；已经在用的 → 进编辑页
-  · 按 Y：直接设为本次要用的（不用进编辑页按确认）
-  · 按 F 或手柄 X：改名（最多 50 个字，可以重名）
-  · 按左摇杆（L3）或键盘 E：进入移动模式，上下键换顺序，再按 L3 / A / E 放下，B 取消
-  · 鼠标：点还没选中的那一行就是选中，点已经在用的那一行进编辑页
-「新建套装」会先让你起名字，留空就用默认名。
-
-
-■ 猫饭页
---------
-每份猫饭记的是体力、耐力、攻击、防御、属性耐性和三个猫饭技能。
-操作和套装页一样：A 选中 / 编辑，Y 直接选，F 或 X 改名，L3 或 E 换顺序。
-如果当前用的那套套装里自带猫饭，这一页会显示「这套套装自带猫饭」，
-这时候列表里的行只能编辑，不能选——套装的猫饭优先。
-
-
-■ 设置页
---------
-界面语言、重开方式（直接重开 / 重置后回据点再接 / 只接任务不出发）、
-翼龙起始、缩短转场黑屏、面板不透明度、快捷键、存档位。
-
-快捷键三行：重开 / 打开面板 / 只重置任务。
-选中一格按 A（或点一下），再按想用的键，松开就记住；
-录的时候按手柄 X 或键盘 Delete 就是清空这一格。
-
-
-■ 从原版 IN-Q 导入
-------------------
-原版 IN-Q（exe + config.txt 那个版本）里的全套可以直接搬过来：
-设置页最下面点「从原版 IN-Q 导入」，在弹出的框里找到那个 config.txt 选中就行。
-框会从游戏目录开始；左上「上一级」往上退，盘符按钮直接跳。
-
-搬过来的是：全套名、装备套装、道具套装、联动快捷栏、任务 ID、猫饭、界面语言、
-重置方式。原版的手柄快捷键不搬（原版没有面板，这一项是插件自己的）。
-导入是整体覆盖：你现在有的全套会被清掉换成原版的，猫饭也是。
-第一次运行、而且配置里一套套装都没有时，插件会自动在附近找一次 config.txt 直接导入。
-
-
-■ 存档位
---------
-同一台电脑换 Steam 账号，或者同一账号换存档，套装和猫饭都各存各的，不会串。
-账号是自动认的；存档位要在设置页点一下 1 / 2 / 3（游戏里换了存档之后来点一下）。
-切换只换套装和猫饭：面板、快捷键、语言、不透明度这些设置始终是你自己的，跟着人走。
-点当前这一档不会有任何动作；切走再切回来，原来那档的套装和猫饭照原样读回来。
-
-
-■ HDR 显示器
-------------
-面板颜色会按游戏当前的画面自动适配，HDR 开着也能用。
-如果面板明显偏亮或者发灰：打开 nativePC\plugins\BetterINQ\BetterINQ.ini，
-把 [General] 里的 Hdr 改成 off 存盘，下次进游戏生效。
-
-
-■ 遇到问题
-----------
-· 没看到「已就绪」提示：先确认前置（dinput8.dll / loader.dll）在不在游戏根目录；
-  再打开 nativePC\plugins\BetterINQ\BetterINQ.log 看看有没有内容。
-· 面板开着时键鼠还漏进游戏：把上面那个日志文件的最后几行发给我。
-· 退出游戏时画面没了但一直没关，声音还在：等十来秒会自动结束，不用管。
-· 中文/日文输入法：面板里的输入框可以直接用系统输入法打字，候选条跟着输入框走。
-
-
-■ 和原版 IN-Q 的区别
+一、打开面板与基本操作
 --------------------
-· 做成游戏插件，不会出现「开了游戏却检测不到」
-· 修了道具套装套错的问题（在游戏里给道具套装排过序的时候）
-· 修了黑龙开局脱衣装（装了改同一处的模组时以那个模组为准）
-· 保留了原版「只重置任务」：重置回据点，不接任务也不出发
-· 多了游戏内面板、三语界面、日文罗马音搜索、导入原版配置
+以下是默认快捷键；如果你改过快捷键，以设置页显示的为准。
+
+打开 / 关闭面板：手柄 LB + LT + X，或键盘 Insert。
+重开任务：手柄 LT + RT + L3 + R3，或键盘 Delete。
+只重置任务：手柄 LB + RB + L3 + R3，或键盘 Home。
+L3 / R3 表示按下左 / 右摇杆。手柄按键名称采用 Xbox 标识。
+
+面板内：
+· 十字键 / 左摇杆 / 键盘方向键：移动选择。
+· 键盘也可用 WASD（W 上、A 左、S 下、D 右），或 HJKL（H 左、J 下、K 上、L 右）。
+  搜索、改名或录入快捷键时，这些字母不会用来导航。
+  下文单独写 A / B / X / Y 时指手柄按键；键盘 A 用于向左，确认请用空格或回车。
+· A / 空格 / 回车：确认或操作当前项。
+· B / Esc：返回；在主页面返回会关闭面板。
+· 向左移动到内容边缘后进入左侧栏，上下选择页面，向右返回内容。
+· 鼠标左键：点击操作；鼠标滚轮：滚动列表。
+· 输入框支持中文、英文和日文输入。
+
+打开面板后，默认选中主页的「重开」，直接按 A 即可重开。
+面板打开时，请在面板内完成操作；关闭后恢复游戏操作。
+除需单独确认的操作外，设置和编辑内容会自动保存。
+
+二、任务页
+----------
+「重开」：按当前选择的任务和重开方式重新开始。
+「只重置任务」：重置并回到据点，不重新接任务，也不出发。
+
+选择「换任务」，找到任务后确认，即可设为下次重开的任务。
+搜索支持任务 ID、中文 / 英文 / 日文任务名、中文拼音及首字母、日文假名及罗马音。
+例如：heilong、hl、kokuryuu。
+
+套装指定了任务时，重开优先使用套装中的任务。
+未套用指定任务的套装时，使用任务页当前显示的任务。
+
+三、套装页
+----------
+一套预设可以组合：装备套装、道具套装、猫饭和任务。
+选择「新建套装」并输入名称即可创建；名称留空时使用默认名。
+
+列表操作：
+· A / 空格 / 回车 / 鼠标左键：套用当前项；对已套用项再操作一次，取消套用。
+· Y / 键盘 Y / 鼠标右键：直接编辑，不改变当前套用选择。
+· X / 键盘 F：修改名称，最多 50 个字符，可以重名。
+· L3 / 键盘 E：进入移动模式；用上下方向键、W / S 或 K / J 调整顺序，再按 L3 / 手柄 A / 键盘 E 放下，B 取消。
+
+编辑时，分别选择装备、道具、猫饭和任务；「—」表示不更换该项。
+猫饭选择「跟全局那份」时，使用猫饭页选中的预设。
+「联动快捷栏」用于同时切换所选道具套装关联的快捷栏。
+游戏内修改装备或道具套装名称后，面板列表会自动更新。
+
+套用后，装备会尽快更换；读盘或重开过程中可能稍后才换上。
+道具、猫饭和任务在之后重开或进入任务时按选择生效。
+编辑已套用套装的装备选项，也会请求更换装备。
+编辑页的「确认 / 确认并套用」会套用这套预设并返回列表。
+只想修改内容、不想套用时，编辑后直接返回即可。
+
+取消套用不会把已经穿上的装备换回去。
+编辑页也可取消套用或删除该套装；删除前需要确认。
+
+四、猫饭页
+----------
+选择「新建猫饭」，设置体力、耐力、攻击、防御、属性耐性和三个猫饭技能。
+列表会显示预设内容，方便直接比较。
+
+列表操作与套装页一致：
+· A / 空格 / 回车 / 鼠标左键：选用，再操作一次取消。
+· Y / 键盘 Y / 鼠标右键：直接编辑，不改变当前选择。
+· X / 键盘 F：改名。
+· L3 / 键盘 E：进入移动模式，用上下方向键、W / S 或 K / J 调整顺序；L3 / 手柄 A / 键盘 E 放下，B 取消。
+
+选中的猫饭预设会在进入任务时使用。
+未选预设或取消预设，不会清除或覆盖你在游戏里手动吃的猫饭。
+
+如果当前套装指定了猫饭，优先使用套装中的那份。
+此时猫饭页会显示提示，A 不能切换选择，但 Y / 鼠标右键仍可编辑。
+只想修改内容、不想改变选择时，编辑后直接返回。
+
+仍被套装引用的已删除猫饭会标成「（已删除）」，仍可查看和编辑；
+不再有套装引用后，才会从列表消失。
+
+五、设置页
+----------
+插件状态：
+· 装载态：正常使用重开、套装和猫饭功能。
+· 卸载态：暂停上述功能，仍可打开面板、查看和编辑；不能在列表切换套用。
+  当前选择会保留，切回装载态即可继续使用，不必重启游戏。
+  卸载态不等于恢复游戏原本的重置和转场速度。
+
+其他设置：
+· 语言：中文 / English / 日本語。
+· 重开方式：直接重开、重置后回据点再接、只接任务不出发。
+· 翼龙起始：普通地图从翼龙上开始；关闭时从营地开始。
+· 缩短转场黑屏：下次启动游戏生效。
+· 不透明度：调整面板背景深浅。
+
+修改快捷键：
+1. 找到「重开」「打开面板」或「只重置任务」对应的手柄格 / 键盘格。
+2. 按 A 或点击该格，按住想使用的按键组合，再全部松开即可保存。
+   手柄快捷键至少需要两个按键。
+3. 要清除快捷键，选中该格后按 Esc；手柄格也可单按 X 清除。
+   此时 Esc 只清除快捷键，不会同时返回或关闭面板。
+   打开面板的快捷键至少保留一个入口。
+
+存档位：
+游戏内切换角色存档后，在这里选择对应的 1 / 2 / 3。
+套装和猫饭按存档位分别保存；语言、快捷键等面板设置不随存档位切换。
+
+从原版 IN-Q 导入：
+点击「选择 config.txt…」，找到原版 IN-Q 的 config.txt 并选中。
+可以用「上一级」或盘符按钮寻找文件。
+注意：导入会替换当前存档位已有的套装和猫饭，请先确认是否需要保留。
+
+清空所有套装和猫饭：
+按提示完成两次确认后清空当前存档位的套装和猫饭。
+此操作无法撤销，请谨慎使用。
 
 
-■ 鸣谢
-------
-核心逻辑移植自 IN-Q 的 CheatEngine 版（INQ.CT）：
-  原作者 年糕狗三世（B 站 BV1yz2PBNEWn），作者允许修 bug、加功能后重新分发
-  CT 中文化与修改：QCanon
-面板界面使用 Dear ImGui（MIT 许可，见同目录的「第三方许可-Dear ImGui.txt」）
+English
+-------
+
+1. Opening the panel and basic controls
+--------------------------------------
+These are the default hotkeys. If you have changed them, use the bindings shown in Settings.
+
+Open / close panel: LB + LT + X on a controller, or Insert on the keyboard.
+Restart quest: LT + RT + L3 + R3, or Delete.
+Reset quest only: LB + RB + L3 + R3, or Home.
+L3 / R3 mean pressing the left / right stick. Controller labels use the Xbox layout.
+
+Inside the panel:
+· D-pad / left stick / arrow keys: move the selection.
+· You can also use WASD (W up, A left, S down, D right), or HJKL (H left, J down, K up, L right).
+  These letters do not navigate while searching, renaming or recording a hotkey.
+  A / B / X / Y below refer to controller buttons unless marked as keyboard keys.
+  Keyboard A moves left; use Space or Enter to confirm.
+· A / Space / Enter: confirm or activate the selected item.
+· B / Esc: go back; going back from a main page closes the panel.
+· Move left past the content edge to enter the sidebar. Move up or down to choose a page, then right to return to its content.
+· Left mouse button: click to interact. Mouse wheel: scroll lists.
+· Text fields support Chinese, English and Japanese input.
+
+The panel opens with Restart selected on the home page. Press A to restart immediately.
+While the panel is open, use its controls. Close it to resume normal game controls.
+Settings and edits are saved automatically, except for actions that ask for confirmation.
+
+2. Quest page
+-------------
+Restart: restart using the selected quest and restart mode.
+Reset quest only: reset and return to base without accepting another quest or departing.
+
+Choose Quests, find a quest, and confirm it to use it for the next restart.
+Search accepts quest IDs, Chinese / English / Japanese names, Chinese pinyin and initials, and Japanese kana and romaji.
+Examples: heilong, hl, kokuryuu.
+
+If the active loadout specifies a quest, that quest takes priority on restart.
+Otherwise, the quest currently shown on the Quest page is used.
+
+3. Loadouts page
+----------------
+A loadout combines an equipment loadout, an item loadout, a meal and a quest.
+Choose New loadout and enter a name to create one. Leave the name empty to use a default name.
+
+List controls:
+· A / Space / Enter / left-click: apply the item. Activate the applied item again to stop applying it.
+· Y / keyboard Y / right-click: edit directly without changing the active selection.
+· X / keyboard F: rename, up to 50 characters. Duplicate names are allowed.
+· L3 / keyboard E: enter reorder mode. Use up/down arrows, W / S or K / J to reorder, then press L3 / controller A / keyboard E to place the item, or B to cancel.
+
+In the editor, select the equipment, items, meal and quest. “—” leaves that item unchanged.
+Choose “the global meal” to use the preset selected on the Meals page.
+Link shortcut bar also switches to the shortcut bar associated with the selected item loadout.
+Equipment and item loadout names update automatically after you rename them in the game.
+
+Applying a loadout changes equipment as soon as possible. During loading or a restart, the change may wait until later.
+Items, meals and quests take effect on a subsequent restart or quest entry, as appropriate.
+Changing the equipment option of the active loadout also requests an equipment change.
+The editor's OK / apply button applies that loadout and returns to the list.
+To edit without applying, make your changes and go back instead.
+
+Stopping a loadout does not restore your previous equipment.
+You can also stop applying or delete a loadout from its editor. Deletion requires confirmation.
+
+4. Meals page
+-------------
+Choose New meal to set health, stamina, attack, defense, elemental resistance and three food skills.
+Each list entry shows its preset details for easy comparison.
+
+List controls are the same as on the Loadouts page:
+· A / Space / Enter / left-click: select a preset; activate it again to clear the selection.
+· Y / keyboard Y / right-click: edit directly without changing the selection.
+· X / keyboard F: rename.
+· L3 / keyboard E: enter reorder mode. Use up/down arrows, W / S or K / J to reorder; L3 / controller A / keyboard E to place, B to cancel.
+
+The selected meal preset is used when entering a quest.
+With no preset selected, manually eaten meals are not cleared or overwritten.
+
+If the active loadout specifies a meal, that meal takes priority.
+The Meals page shows a notice: A cannot change the selection, but Y / right-click still opens the editor.
+To edit without changing the selection, make your changes and go back.
+
+A deleted meal that is still used by a loadout remains visible with a “(deleted)” label and can still be edited.
+It disappears from the list once no loadout uses it.
+
+5. Settings page
+----------------
+Plugin state:
+· Loaded: restart, loadouts and meals work normally.
+· Unloaded: pauses these features while keeping the panel available for viewing and editing. Applying items from the lists is disabled.
+  Your selections are kept. Switch back to Loaded to resume without restarting the game.
+  Unloaded does not restore the game's original reset and transition timing.
+
+Other settings:
+· Language: 中文 / English / 日本語.
+· Restart mode: restart directly, reset and return to base before accepting again, or accept without departing.
+· Start with the wingdrake: begin normal maps on the wingdrake; turn it off to start at camp.
+· Shorten transition fades: takes effect the next time you launch the game.
+· Opacity: adjust the panel background opacity.
+
+Changing hotkeys:
+1. Find the controller or keyboard cell for Restart, Open panel or Reset only.
+2. Press A or click the cell, hold the desired keys or buttons, then release all of them to save.
+   Controller shortcuts require at least two buttons.
+3. To clear a binding, focus its cell and press Esc. X also clears a controller cell.
+   Here, Esc only clears the binding; it does not also go back or close the panel.
+   At least one binding for opening the panel must remain.
+
+Save slot:
+After switching character saves in the game, select the matching slot: 1, 2 or 3.
+Loadouts and meals are saved separately for each slot. Panel settings such as language and hotkeys stay the same.
+
+Import from the original IN-Q:
+Click Choose config.txt… and select config.txt from your original IN-Q folder.
+Use Up or the drive buttons to find the file.
+Warning: importing replaces the loadouts and meals in the current slot. Check whether you need to keep them first.
+
+Clear all sets and meals:
+Follow both confirmation prompts to clear the current slot's loadouts and meals.
+This cannot be undone. Use it with care.

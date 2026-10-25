@@ -59,10 +59,13 @@ bool WriteMem(std::uintptr_t addr, const void* bytes, std::size_t n);
 bool InstallCtxHook(std::uintptr_t site, std::size_t len, Handler h,
                     const std::uint8_t* displaced, std::size_t dlen);
 
-// 「call 闸门」：site 是一条 5 字节 call rel32。*flag == skipWhen 时跳过这次调用
-// （setOnSkip >= 0 时顺手把 *flag 改成它），否则照常调用原目标。
+// 「call 闸门」：site 是一条 5 字节 call rel32。仅当 *enabled != 0 且
+// *flag == skipWhen 时跳过这次调用（setOnSkip >= 0 时顺手把 *flag 改成它），
+// 否则照常调用原目标。inflight 覆盖整段判定/写回/跳转，运行时停用可等闸门排空。
 bool InstallCallGate(std::uintptr_t site, volatile std::int32_t* flag,
-                     std::int32_t skipWhen, std::int32_t setOnSkip);
+                     std::int32_t skipWhen, std::int32_t setOnSkip,
+                     volatile std::int32_t* enabled = nullptr,
+                     volatile std::int32_t* inflight = nullptr);
 
 // 特征码查找，pattern 形如 "48 8B CB ?? 50"
 std::vector<std::uintptr_t> FindAll(std::uintptr_t begin, std::size_t len, const char* pattern);

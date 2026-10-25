@@ -480,9 +480,7 @@ int Import(const std::wstring& path, Config& cfg, std::string& err, std::string*
     if (!Parse(text, p, err)) return -1;
 
     // 导入就是覆盖：原版的全套和猫饭直接顶掉现在的，不做合并
-    cfg.sets.clear();
-    cfg.foods.clear();
-        cfg.foodOrder.clear();
+    cfg.ClearLoadouts(); // IDs are reissued: never carry selections onto unrelated imports.
 
     std::string oddStatus, oddMeal;
     int withMeal = 0, noMeal = 0;
@@ -502,7 +500,7 @@ int Import(const std::wstring& path, Config& cfg, std::string& err, std::string*
     for (const Entry& e : p.sets) {
         ++index;
         LoadoutSet s;
-        s.id = cfg.NextSetId();
+        s.id = cfg.AllocSetId();   // 发号只增不减：导入不会顶掉别处引用的旧编号
         s.name = Trim(e.name);
         if (s.name.empty()) s.name = "Set " + std::to_string(index);
         s.equip = e.equip;
@@ -540,9 +538,7 @@ int Import(const std::wstring& path, Config& cfg, std::string& err, std::string*
                 }
             }
             if (!key) {
-                key = 1;
-                for (const auto& kv : cfg.foods)
-                    if (kv.first >= key) key = kv.first + 1;
+                key = cfg.AllocFoodId();
                 cfg.foods[key] = f;
             }
             s.food = key;
@@ -555,10 +551,6 @@ int Import(const std::wstring& path, Config& cfg, std::string& err, std::string*
         cfg.sets.push_back(s);
         ++imported;
     }
-
-    // 编号都是这次重新发的：原来的全局引用可能指向不存在的套装 / 猫饭
-    if (!cfg.FindSetById(cfg.activeSet)) cfg.activeSet = 0;
-    if (!cfg.foods.count(cfg.food)) cfg.food = 0;
 
     if (notes) {
         std::string out;

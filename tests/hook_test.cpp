@@ -130,6 +130,8 @@ static void H2(hook::Ctx* c)
 }
 
 volatile std::int32_t g_flag = 0;
+volatile std::int32_t g_gateEnabled = 1;
+volatile std::int32_t g_gateInflight = 0;
 
 int main()
 {
@@ -172,13 +174,20 @@ int main()
     // ---- 3 ----
     g_t3calls = 0; g_flag = 0;
     CHECK(t3() == 5 && g_t3calls == 1, "t3 挂钩前正常调用");
-    CHECK(hook::InstallCallGate((std::uintptr_t)t3_site, &g_flag, 2, 3), "装上 call 闸门（=2 时跳过，并改成 3）");
+    CHECK(hook::InstallCallGate((std::uintptr_t)t3_site, &g_flag, 2, 3, &g_gateEnabled, &g_gateInflight),
+          "装上可停用 call 闸门（=2 时跳过，并改成 3）");
     g_t3calls = 0; g_flag = 0;
-    CHECK(t3() == 5 && g_t3calls == 1 && g_flag == 0, "flag=0 → 照常调用，flag 不变");
+    CHECK(t3() == 5 && g_t3calls == 1 && g_flag == 0 && g_gateInflight == 0,
+          "flag=0 → 照常调用，闸门计数归零");
     g_flag = 2;
-    CHECK(t3() == 5 && g_t3calls == 1 && g_flag == 3, "flag=2 → 跳过调用，flag 改成 3");
-    g_flag = 3;
-    CHECK(t3() == 5 && g_t3calls == 2 && g_flag == 3, "flag=3 → 照常调用");
+    CHECK(t3() == 5 && g_t3calls == 1 && g_flag == 3 && g_gateInflight == 0,
+          "enabled + flag=2 → 跳过调用，flag 改成 3，计数归零");
+    g_flag = 2; g_gateEnabled = 0;
+    CHECK(t3() == 5 && g_t3calls == 2 && g_flag == 2 && g_gateInflight == 0,
+          "disabled + flag=2 → 不跳过、不改 flag，计数归零");
+    g_gateEnabled = 1; g_flag = 3;
+    CHECK(t3() == 5 && g_t3calls == 3 && g_flag == 3 && g_gateInflight == 0,
+          "flag=3 → 照常调用，闸门计数归零");
 
     // ---- 4：MantleLoad 修复 —— rsi==0 直接 ret ----
     CHECK(t4_with_rsi(1) == 7 && t4_with_rsi(0) == 7, "t4 挂钩前两种 rsi 都执行函数体");

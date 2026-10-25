@@ -14,6 +14,13 @@ struct FoodSkillName { int id; const char* zh; const char* en; const char* ja; }
 
 namespace gamedata {
 
+// 游戏认的任务 ID 范围（quests.inc 里 101~67809 全覆盖，两端都算）。0 在配置里另有含义：
+// 「不指定」/「用上一次的任务」，所以判断一个 ID 是不是真任务一律走这里，别再各写各的边界
+// （0.7.1 里 inq.cpp 两处边界对不上，套装任务填 67809 会被静默吞掉）。
+constexpr int kQuestIdMin = 101;
+constexpr int kQuestIdMax = 67809;
+inline bool ValidQuestId(int id) { return id >= kQuestIdMin && id <= kQuestIdMax; }
+
 const QuestGroup* Groups(int& count);
 const QuestInfo* Quests(int& count);
 const QuestInfo* FindQuest(int id);
@@ -33,5 +40,7 @@ bool QuestMatches(const QuestInfo& q, const std::string& needle);
 
 const FoodSkillName* FoodSkills(int& count);
 const char* FoodSkillNameOf(int id);   // 按当前语言；找不到返回 "?"
+// 内置三语短名；每次调用按当前语言取值。-1 为 无/None/なし，未知 ID 返回 "?"。
+const char* FoodSkillShortNameOf(int id);
 
 } // namespace gamedata

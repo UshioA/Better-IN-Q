@@ -11,6 +11,10 @@
 namespace {
 #include "quests.inc"
 #include "foodskills.inc"
+#include "foodskill_shortnames.inc"
+
+static_assert(sizeof(kFoodSkillShortNames) / sizeof(kFoodSkillShortNames[0]) ==
+              sizeof(kFoodSkills) / sizeof(kFoodSkills[0]), "Food skill short-name coverage changed");
 
 // 一个任务名的拼音：每个字一组读音
 using Syllables = std::vector<std::vector<std::string>>;
@@ -250,6 +254,13 @@ const FoodSkillName* FoodSkills(int& count)
 const char* FoodSkillNameOf(int id)
 {
     for (const auto& f : kFoodSkills)
+        if (f.id == id) return i18n::Tr(f.zh, f.en, f.ja);
+    return "?";
+}
+
+const char* FoodSkillShortNameOf(int id)
+{
+    for (const auto& f : kFoodSkillShortNames)
         if (f.id == id) return i18n::Tr(f.zh, f.en, f.ja);
     return "?";
 }
