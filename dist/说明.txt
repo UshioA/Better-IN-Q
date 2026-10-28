@@ -1,4 +1,4 @@
-Better-IN-Q v0.7.2
+Better-IN-Q v0.7.2.1
 面板操作说明 / Panel Guide
 =========================
 
@@ -8,6 +8,7 @@ Better-IN-Q v0.7.2
 一、打开面板与基本操作
 --------------------
 以下是默认快捷键；如果你改过快捷键，以设置页显示的为准。
+请先进入存档、等待角色场景加载完成，再按面板快捷键；启动黑屏和标题阶段的快捷键不会排队执行。
 
 打开 / 关闭面板：手柄 LB + LT + X，或键盘 Insert。
 重开任务：手柄 LT + RT + L3 + R3，或键盘 Delete。
@@ -130,6 +131,7 @@ English
 1. Opening the panel and basic controls
 --------------------------------------
 These are the default hotkeys. If you have changed them, use the bindings shown in Settings.
+Load a save and wait for the character scene to finish loading before opening the panel. Hotkeys pressed during the startup black screen or title screen are not queued.
 
 Open / close panel: LB + LT + X on a controller, or Insert on the keyboard.
 Restart quest: LT + RT + L3 + R3, or Delete.

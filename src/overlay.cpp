@@ -181,8 +181,30 @@ LRESULT ForwardToGame(HWND h, UINT msg, WPARAM w, LPARAM l, WNDPROC previous)
 // 崩溃诊断：当前在哪个钩子/阶段（异常处理里会读它）
 std::atomic<const char*> g_stage{"idle"};
 void SetStage(const char* s) { g_stage = s; }
-// 重入计数：我们自己的渲染里再触发 Present/面板渲染会无限套娃（栈溢出）
+// Panel rendering and the complete Present forwarding chain need separate guards:
+// g_depth ends before the original Present runs, so it cannot bound a hook cycle.
 thread_local int g_depth = 0;
+constexpr int kMaxPresentDepth = 8;
+thread_local int g_presentDepth = 0;
+struct PresentCall;
+thread_local PresentCall* g_presentCall = nullptr;
+struct PresentCall {
+    IDXGISwapChain* sc;
+    PresentCall* previous;
+    bool allowed;
+    explicit PresentCall(IDXGISwapChain* swapChain)
+        : sc(swapChain), previous(g_presentCall), allowed(++g_presentDepth <= kMaxPresentDepth)
+    {
+        // Pointer identity is intentional; never query COM from this boundary.
+        // TEST/normal transitions on one swapchain must not evade cycle detection.
+        for (const PresentCall* p = previous; allowed && p; p = p->previous)
+            if (p->sc == sc) allowed = false;
+        g_presentCall = this;
+    }
+    ~PresentCall() { g_presentCall = previous; --g_presentDepth; }
+    PresentCall(const PresentCall&) = delete;
+    PresentCall& operator=(const PresentCall&) = delete;
+};
 void (*g_debugAfterDraw)(void*) = nullptr;
 void (*g_debugAfterDraw12)(void*, void*) = nullptr;
 ImU32 g_lastScaledEvent = 0;
@@ -1183,13 +1205,15 @@ void PerfTick(unsigned long long begin, unsigned long long end)
 
 HRESULT WINAPI HkPresent(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
+    // First operation, before dead/TEST shortcuts or renderer locking. Keep this
+    // frame alive until the original chain returns, not merely while drawing.
+    PresentCall call(sc);
+    if (!call.allowed) return DXGI_ERROR_INVALID_CALL; // Do not forward or fake success.
     SetStage("present");
-    if (g_dead.load()) return g_present(sc, sync, flags);   // 窗口都没了，纯转发
-    if (g_depth > 3) {                            // Present 套娃：只转发，不再走我们的逻辑
-        static std::atomic<int> warned{0};
-        if (warned.fetch_add(1) < 3) Log("overlay: Present 重入 %d 层，跳过本帧的面板处理", g_depth);
+    // A different swapchain may legitimately nest, but must not reenter shared
+    // renderer state. Its original chain is still bounded by the guard above.
+    if (g_dead.load() || (flags & DXGI_PRESENT_TEST) || g_presentDepth > 1)
         return g_present(sc, sync, flags);
-    }
     {
     std::lock_guard<std::recursive_mutex> lock(g_rendererMutex);
     LARGE_INTEGER q0, q1;

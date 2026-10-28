@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "config.h"
+#include "game.h"
+#include "startup_gate.h"
 #include "crashfilter.h"
 #include "cursorfilter.h"
 #include "hangdump.h"
@@ -41,7 +43,7 @@ volatile LONG g_teardown = 0;   // 窗口已销毁/进程在退出，这时候�
 // 窗口已经没了、我们正在收尾：异常处理器从此一律不碰（见 OnCrash）。
 std::atomic<bool> g_exiting{false};
 std::atomic<long> g_inCrash{0};
-const char* const kVersion = "0.7.2";
+const char* const kVersion = "0.7.2.1";
 
 // 主循环线程和游戏渲染线程（画面板）共用，都要先拿这把锁
 std::mutex g_mx;
@@ -179,6 +181,34 @@ struct Filter {
     }
 };
 
+// Same player-chain predicate as game::InScene, plus save/UI/loading checks.
+// ReadProcessMemory avoids VirtualQuery/memcpy races on the worker thread;
+// these remain conservative snapshots, not a Steam/DXGI hook-readiness proof.
+template <class T> bool StartupRead(std::uintptr_t address, T& value)
+{
+    SIZE_T read = 0;
+    value = T{};
+    return address >= 0x10000 &&
+        ::ReadProcessMemory(::GetCurrentProcess(), reinterpret_cast<const void*>(address),
+                            &value, sizeof(value), &read) && read == sizeof(value);
+}
+
+bool StartupSceneSample()
+{
+    std::uintptr_t player = 0, entity = 0, root = 0, ui = 0, load = 0;
+    std::uintptr_t save = 0, base = 0;
+    std::uint64_t slot = 0;
+    std::uint32_t loading = 0;
+    return StartupRead(game::pPlayerRoot, player) && player &&
+        StartupRead(player + 0x50, entity) && entity &&
+        StartupRead(game::pUiBase, root) && root &&
+        StartupRead(root + 0x278, ui) && ui && StartupRead(ui + 0x20, load) && load &&
+        StartupRead(load + 0x1D04, loading) && loading == 0 &&
+        StartupRead(game::pSave, save) && save &&
+        StartupRead(save + 0xA8, base) && base &&
+        StartupRead(save + 0xA0, slot) && slot < 3;
+}
+
 DWORD WINAPI Worker(LPVOID)
 {
     while (!::GetModuleHandleW(L"MonsterHunterWorld.exe") && !g_stop) ::Sleep(200);
@@ -251,11 +281,11 @@ DWORD WINAPI Worker(LPVOID)
     cb.init = OnOverlayInit;
     cb.opened = OnOverlayOpened;
     cb.draw = OnOverlayDraw;
-    std::string err;
-    if (g_cfg.debugNoWndHook) overlay::SetWndHook(false);   // 要在 Install 之前设，窗口过程是那时接管的
-    const bool panelOk = off.overlay ? false : overlay::Install(cb, err);
+    if (g_cfg.debugNoWndHook) overlay::SetWndHook(false);
+    startup::Gate startupGate;
+    bool panelOk = false;
     if (off.overlay) Log("debug: overlay 关掉了，没有面板（快捷键重开照常）");
-    else if (!panelOk) Log("overlay: %s", err.c_str());
+    else Log("overlay: 等场景稳定并重新按面板快捷键后才安装（启动不建临时交换链）");
 
     if (ok) Chat(std::string("Better-IN-Q ") + kVersion + i18n::Tr(" 已就绪", " ready", " 準備完了"));
     else Chat(i18n::Tr("Better-IN-Q：重开功能没装上，详情见 BetterINQ.log",
@@ -361,7 +391,19 @@ DWORD WINAPI Worker(LPVOID)
             if (capturing) g_model.keysHeld = KeysHeld();
             else g_model.keysHeld.clear();
         }
-        if (in.Fired(hk.panel) && !capturing) {
+        // Always consume edges, including title/loading frames. Never defer an
+        // early held shortcut until the first ready scene sample.
+        const bool panelKey = in.Fired(hk.panel);
+        startupGate.Sample(StartupSceneSample(), now);
+        if (!startupGate.SceneReady() && overlay::IsOpen()) SetPanel(false);
+        const startup::Gate::PanelAction panelAction = startupGate.Panel(panelKey && !capturing, off.overlay);
+        if (panelAction == startup::Gate::PanelAction::Install) {
+            std::string installError;
+            panelOk = overlay::Install(cb, installError);
+            startupGate.CompleteInstall(panelOk);
+            if (!panelOk) Log("overlay: %s", installError.c_str());
+        }
+        if (panelAction != startup::Gate::PanelAction::None) {
             if (overlay::Failed() || !panelOk) Chat(i18n::Tr("Better-IN-Q：面板画不出来，详情见 BetterINQ.log（重开快捷键照常能用）",
                                                              "Better-IN-Q: the panel cannot be drawn, see BetterINQ.log (the restart hotkey still works)",
                                                              "Better-IN-Q：パネルを描画できません。BetterINQ.log を見てください（再開ホットキーは使えます）"));
@@ -397,18 +439,21 @@ DWORD WINAPI Worker(LPVOID)
                 Log("runtime: %s", runtimeMode == runtime::Mode::Active ? "装载态" : "卸载态（业务旁路，钩子常驻）");
             }
 
-            const runtime::HotkeyActions actions = runtime::GateHotkeys(runtimeMode, false, restartKey, resetKey);
+            const bool sceneActions = startupGate.AllowsActions() && !capturing;
+            const runtime::HotkeyActions actions = runtime::GateHotkeys(runtimeMode, false,
+                                                                       sceneActions && restartKey,
+                                                                       sceneActions && resetKey);
             if (!open && actions.restart) { Log("hotkey: restart"); inq::RequestRestart(g_cfg); }
             if (!open && actions.resetOnly) { Log("hotkey: reset only"); inq::RequestResetOnly(); }
 
             if (m.reqClose) { m.reqClose = false; SetPanel(false); }
             if (m.reqRestart) {
                 m.reqRestart = false;
-                if (runtimeMode == runtime::Mode::Active) { Log("panel: restart"); inq::RequestRestart(g_cfg); }
+                if (runtimeMode == runtime::Mode::Active && startupGate.AllowsActions()) { Log("panel: restart"); inq::RequestRestart(g_cfg); }
             }
             if (m.reqResetOnly) {
                 m.reqResetOnly = false;
-                if (runtimeMode == runtime::Mode::Active) { Log("panel: reset only"); inq::RequestResetOnly(); }
+                if (runtimeMode == runtime::Mode::Active && startupGate.AllowsActions()) { Log("panel: reset only"); inq::RequestResetOnly(); }
             }
             if (m.reqApplyEquip) {
                 m.reqApplyEquip = false;

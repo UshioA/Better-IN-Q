@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 # 打发布包（狩技盒子拖进去就能装，也可以直接解压到游戏根目录）。
 #   py -3 tools/make_zip.py [输出目录] [文件名后缀]
-#   例：py -3 tools/make_zip.py out -exitfix  →  Better-IN-Q v0.7.2-exitfix.zip
+#   例：py -3 tools/make_zip.py out -exitfix  →  Better-IN-Q v0.7.2.1-exitfix.zip
 #
 # zip 根目录是 nativePC\，文件名就是盒子里显示的 mod 名。
 # 不带配置文件：插件第一次运行自己生成 BetterINQ.ini，这样它不归盒子管，
 # 以后用盒子更新/卸载都不会冲掉玩家改过的设置。
 import hashlib, os, sys, zipfile
 
-VER = 'v0.7.2'
+VER = 'v0.7.2.1'
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 OUT_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, 'out')
 SUFFIX = sys.argv[2] if len(sys.argv) > 2 else ''

@@ -56,7 +56,98 @@ struct Window {
     }
     ~Window() { if(IsWindow(h)) DestroyWindow(h); if(sc)sc->Release(); if(ctx)ctx->Release(); if(dev)dev->Release(); }
 };
+// White-box fake-original tests: no DXGI object is dereferenced. A callback
+// ceiling makes a pre-fix forwarding loop fail deterministically, not overflow.
+static char presentTokens[64];
+static IDXGISwapChain* PresentToken(int i) {
+    return reinterpret_cast<IDXGISwapChain*>(&presentTokens[i]);
+}
+enum class PresentMode { Plain, Same, FlipTest, Different, TooDeep, BackToAncestor, BecomeDead };
+static PresentMode presentMode=PresentMode::Plain;
+static int presentOriginalCalls=0, presentSeenDepth=0, presentTargetDepth=3;
+static bool presentArguments=true;
+constexpr HRESULT kPresentResult=DXGI_STATUS_OCCLUDED;
+static HRESULT WINAPI FakePresent(IDXGISwapChain* sc,UINT sync,UINT flags) {
+    ++presentOriginalCalls;
+    if(overlay::g_presentDepth>presentSeenDepth) presentSeenDepth=overlay::g_presentDepth;
+    presentArguments &= sync==2 && overlay::g_presentCall && overlay::g_presentCall->sc==sc;
+    if(presentOriginalCalls>32) return E_UNEXPECTED;
+    switch(presentMode) {
+    case PresentMode::Same: return overlay::HkPresent(sc,sync,flags);
+    case PresentMode::FlipTest: return overlay::HkPresent(sc,sync,flags ^ DXGI_PRESENT_TEST);
+    case PresentMode::BecomeDead:
+        overlay::g_dead=true;
+        return overlay::HkPresent(sc,sync,flags | DXGI_PRESENT_TEST);
+    case PresentMode::Different:
+    case PresentMode::TooDeep:
+        if(overlay::g_presentDepth<presentTargetDepth)
+            return overlay::HkPresent(PresentToken(overlay::g_presentDepth),sync,flags);
+        break;
+    case PresentMode::BackToAncestor:
+        return overlay::HkPresent(overlay::g_presentDepth==1 ? PresentToken(1) : PresentToken(0),sync,flags);
+    case PresentMode::Plain: break;
+    }
+    return kPresentResult;
+}
+static void ResetPresentFake(PresentMode mode) {
+    presentMode=mode; presentOriginalCalls=presentSeenDepth=0; presentArguments=true;
+}
+static void CheckPresentClean() {
+    CHECK(overlay::g_presentDepth==0 && overlay::g_presentCall==nullptr);
+    CHECK(overlay::g_depth==0);
+    // Failed recursion cannot poison the next independent call or its HRESULT.
+    ResetPresentFake(PresentMode::Plain);
+    CHECK(overlay::HkPresent(PresentToken(0),2,DXGI_PRESENT_TEST)==kPresentResult);
+    CHECK(presentOriginalCalls==1 && presentSeenDepth==1 && presentArguments);
+    CHECK(overlay::g_presentDepth==0 && overlay::g_presentCall==nullptr);
+}
+static void TestPresentBoundary() {
+    const auto savedPresent=overlay::g_present;
+    const bool savedDead=overlay::g_dead.load();
+    overlay::g_present=FakePresent;
+    // Closed-panel normal forwarding, TEST forwarding and dead forwarding all
+    // have the same boundary. Changing flags must not change the swapchain key.
+    for(bool dead : {false,true}) for(UINT flags : {0u,UINT(DXGI_PRESENT_TEST)}) {
+        overlay::g_dead=dead;
+        for(PresentMode mode : {PresentMode::Same,PresentMode::FlipTest}) {
+            ResetPresentFake(mode);
+            CHECK(overlay::HkPresent(PresentToken(0),2,flags)==DXGI_ERROR_INVALID_CALL);
+            CHECK(presentOriginalCalls==1 && presentSeenDepth==1 && presentArguments);
+            CheckPresentClean();
+        }
+        // Legitimate distinct-swapchain nesting propagates the original result.
+        presentTargetDepth=3;
+        ResetPresentFake(PresentMode::Different);
+        CHECK(overlay::HkPresent(PresentToken(0),2,flags)==kPresentResult);
+        CHECK(presentOriginalCalls==3 && presentSeenDepth==3 && presentArguments);
+        CheckPresentClean();
+        // Distinct pointers cannot bypass the absolute depth bound either.
+        presentTargetDepth=overlay::kMaxPresentDepth+1;
+        ResetPresentFake(PresentMode::TooDeep);
+        CHECK(overlay::HkPresent(PresentToken(0),2,flags)==DXGI_ERROR_INVALID_CALL);
+        CHECK(presentOriginalCalls==overlay::kMaxPresentDepth);
+        CHECK(presentSeenDepth==overlay::kMaxPresentDepth && presentArguments);
+        CheckPresentClean();
+        ResetPresentFake(PresentMode::BackToAncestor);
+        CHECK(overlay::HkPresent(PresentToken(0),2,flags)==DXGI_ERROR_INVALID_CALL);
+        CHECK(presentOriginalCalls==2 && presentArguments);
+        CheckPresentClean();
+    }
+    overlay::g_dead=false;
+    ResetPresentFake(PresentMode::BecomeDead);
+    CHECK(overlay::HkPresent(PresentToken(0),2,0)==DXGI_ERROR_INVALID_CALL);
+    CHECK(overlay::g_dead.load() && presentOriginalCalls==1);
+    CheckPresentClean();
+    // Even a directly self-pointing saved original must terminate safely.
+    overlay::g_present=overlay::HkPresent;
+    CHECK(overlay::HkPresent(PresentToken(0),2,DXGI_PRESENT_TEST)==DXGI_ERROR_INVALID_CALL);
+    overlay::g_present=FakePresent;
+    CheckPresentClean();
+    overlay::g_present=savedPresent;
+    overlay::g_dead=savedDead;
+}
 int main() {
+    TestPresentBoundary();
     WNDCLASSEXW wc{sizeof(wc)}; wc.lpfnWndProc=GameProc; wc.hInstance=GetModuleHandleW(nullptr); wc.lpszClassName=L"BetterINQ_window_chain_test"; RegisterClassExW(&wc);
     std::string err; overlay::Callbacks cb; CHECK(overlay::Install(cb,err));
     Window a; if(!a.Create()) return 2;
