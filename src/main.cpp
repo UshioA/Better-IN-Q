@@ -193,6 +193,27 @@ template <class T> bool StartupRead(std::uintptr_t address, T& value)
                             &value, sizeof(value), &read) && read == sizeof(value);
 }
 
+// Read-only aTitle probe from Astera's documented sArea layout. Do not patch
+// title code (another loader may already own it). Unknown layouts fail closed;
+// the established loaded-scene sample remains a fallback for skipped titles.
+bool StartupTitleSample()
+{
+    constexpr auto areaGlobal = game::EXE + 0x51C42B8;
+    constexpr auto titleVtable = game::EXE + 0x2F108B0;
+    std::uintptr_t manager = 0;
+    std::uint32_t count = 0;
+    if (!StartupRead(areaGlobal, manager) || !manager ||
+        !StartupRead(manager + 0x803C, count) || count == 0 || count > 8) return false;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        std::uintptr_t area = 0, vtable = 0;
+        std::uint8_t started = 0;
+        if (StartupRead(manager + 0x8048 + i * sizeof(area), area) && area &&
+            StartupRead(area, vtable) && vtable == titleVtable &&
+            StartupRead(area + 0x38, started) && started != 0) return true;
+    }
+    return false;
+}
+
 bool StartupSceneSample()
 {
     std::uintptr_t player = 0, entity = 0, root = 0, ui = 0, load = 0;
@@ -285,7 +306,7 @@ DWORD WINAPI Worker(LPVOID)
     startup::Gate startupGate;
     bool panelOk = false;
     if (off.overlay) Log("debug: overlay 关掉了，没有面板（快捷键重开照常）");
-    else Log("overlay: 等场景稳定并重新按面板快捷键后才安装（启动不建临时交换链）");
+    else Log("overlay: 等标题就绪后自动安装一次画面钩子；后续转场不限制面板");
 
     if (ok) Chat(std::string("Better-IN-Q ") + kVersion + i18n::Tr(" 已就绪", " ready", " 準備完了"));
     else Chat(i18n::Tr("Better-IN-Q：重开功能没装上，详情见 BetterINQ.log",
@@ -394,15 +415,22 @@ DWORD WINAPI Worker(LPVOID)
         // Always consume edges, including title/loading frames. Never defer an
         // early held shortcut until the first ready scene sample.
         const bool panelKey = in.Fired(hk.panel);
-        startupGate.Sample(StartupSceneSample(), now);
-        if (!startupGate.SceneReady() && overlay::IsOpen()) SetPanel(false);
-        const startup::Gate::PanelAction panelAction = startupGate.Panel(panelKey && !capturing, off.overlay);
-        if (panelAction == startup::Gate::PanelAction::Install) {
+        const bool sceneSample = StartupSceneSample();
+        const bool wasStartupReady = startupGate.StartupReady();
+        const bool titleSample = !wasStartupReady && StartupTitleSample();
+        startupGate.Sample(titleSample, sceneSample, now);
+        if (!wasStartupReady && startupGate.StartupReady())
+            Log("overlay: startup ready (%s); panel gate latched for this process",
+                titleSample ? "title" : "scene fallback");
+        // Install once on title readiness, not on each scene/blackout transition.
+        // Failed partial installs are never retried; later panel edges report it.
+        if (startupGate.BeginInstall(off.overlay)) {
             std::string installError;
             panelOk = overlay::Install(cb, installError);
             startupGate.CompleteInstall(panelOk);
             if (!panelOk) Log("overlay: %s", installError.c_str());
         }
+        const startup::Gate::PanelAction panelAction = startupGate.Panel(panelKey && !capturing, off.overlay);
         if (panelAction != startup::Gate::PanelAction::None) {
             if (overlay::Failed() || !panelOk) Chat(i18n::Tr("Better-IN-Q：面板画不出来，详情见 BetterINQ.log（重开快捷键照常能用）",
                                                              "Better-IN-Q: the panel cannot be drawn, see BetterINQ.log (the restart hotkey still works)",

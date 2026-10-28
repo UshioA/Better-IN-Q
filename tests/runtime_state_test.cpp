@@ -35,52 +35,58 @@ int main()
     using startup::Gate;
     using PA = Gate::PanelAction;
     Gate gate;
-    gate.Sample(false, 0);
-    CHECK(!gate.AllowsActions() && gate.Panel(true, false) == PA::None,
-          "startup/title edges cannot install or queue a panel");
-    gate.Sample(true, 10);
-    gate.Sample(true, 509);
-    CHECK(!gate.AllowsActions() && gate.Panel(true, false) == PA::None,
-          "scene must remain stable for the full interval");
-    gate.Sample(true, 510);
-    CHECK(gate.SceneReady() && !gate.AllowsActions() && gate.Panel(true, false) == PA::None,
-          "edge on the ready boundary is discarded too");
-    gate.Sample(true, 526);
-    CHECK(gate.AllowsActions() && gate.Panel(false, false) == PA::None,
-          "an early held key has no fresh edge after readiness");
-    CHECK(gate.Panel(true, true) == PA::Unavailable,
-          "disabled overlay never attempts installation");
-    CHECK(gate.Panel(true, false) == PA::Install, "first fresh ready edge attempts installation");
-    gate.CompleteInstall(false);
-    CHECK(gate.Panel(true, false) == PA::Unavailable,
-          "partial/failed installation is never retried");
-    gate.Sample(false, 600);
-    CHECK(!gate.SceneReady() && !gate.AllowsActions() && gate.Panel(true, false) == PA::None,
-          "losing the scene closes every shortcut gate immediately");
-    gate.Sample(true, 700);
-    gate.Sample(true, 1200);
-    CHECK(!gate.AllowsActions(), "restored scene also suppresses its ready boundary");
-    gate.Sample(true, 1216);
-    CHECK(gate.Panel(true, false) == PA::Unavailable, "scene recovery does not retry failed installation");
-
-    Gate installed;
-    installed.Sample(true, 0);
-    installed.Sample(true, Gate::kStableMs);
-    installed.Sample(true, Gate::kStableMs + 16);
-    CHECK(installed.Panel(true, false) == PA::Install, "ready first press installs once");
-    installed.CompleteInstall(true);
-    CHECK(installed.Panel(true, false) == PA::Toggle, "installed panel toggles without reinstalling");
-    installed.Sample(false, 600);
-    CHECK(installed.Panel(true, false) == PA::None, "installed panel cannot reopen on title/loading");
-    installed.Sample(true, 700);
-    installed.Sample(true, 1200);
-    installed.Sample(true, 1216);
-    CHECK(installed.Panel(true, false) == PA::Toggle, "return to scene reuses installed hooks");
-    const auto gated = runtime::GateHotkeys(Mode::Active, false, gate.AllowsActions(), gate.AllowsActions());
-    CHECK(gated.restart && gated.resetOnly, "stable recovered scene permits business edges");
-    gate.Sample(false, 1300);
-    const auto blocked = runtime::GateHotkeys(Mode::Active, false, gate.AllowsActions(), gate.AllowsActions());
-    CHECK(!blocked.restart && !blocked.resetOnly, "title/loading blocks restart and reset edges");
+    gate.Sample(false, false, 0);
+    CHECK(!gate.BeginInstall(false) && gate.Panel(true, false) == PA::None,
+          "early startup cannot install or queue a panel");
+    gate.Sample(true, false, 10);
+    gate.Sample(true, false, 509);
+    CHECK(!gate.StartupReady(), "title must be stable for full interval");
+    gate.Sample(true, false, 510);
+    CHECK(gate.StartupReady() && gate.Panel(true, false) == PA::None,
+          "readiness boundary consumes the early edge");
+    CHECK(!gate.BeginInstall(true), "disabled overlay never installs");
+    CHECK(gate.BeginInstall(false), "title readiness installs without a key or save");
+    gate.CompleteInstall(true);
+    gate.Sample(true, false, 526);
+    CHECK(gate.Panel(false, false) == PA::None, "early held shortcut is not replayed");
+    CHECK(gate.Panel(true, false) == PA::Toggle, "fresh title shortcut opens panel");
+    CHECK(!gate.AllowsActions(), "title panel cannot invoke business shortcuts");
+    gate.Sample(false, false, 600);
+    CHECK(gate.StartupReady() && gate.Panel(true, false) == PA::Toggle,
+          "transition blackout preserves panel availability");
+    CHECK(!gate.BeginInstall(false), "transition never reinstalls graphics hooks");
+    gate.Sample(false, true, 700);
+    gate.Sample(false, true, 1200);
+    CHECK(!gate.AllowsActions(), "business scene readiness boundary remains suppressed");
+    gate.Sample(false, true, 1216);
+    CHECK(gate.AllowsActions(), "stable character scene permits business shortcuts");
+    gate.Sample(false, false, 1300);
+    CHECK(!gate.AllowsActions() && gate.Panel(true, false) == PA::Toggle,
+          "loading blocks game writes but not the panel");
+    gate.Sample(true, false, 1400);
+    CHECK(gate.Panel(true, false) == PA::Toggle && !gate.BeginInstall(false),
+          "return to title preserves panel and never reinstalls");
+    Gate failed;
+    failed.Sample(true, false, 0);
+    failed.Sample(true, false, 500);
+    CHECK(failed.BeginInstall(false), "failure path attempts once");
+    failed.CompleteInstall(false);
+    failed.Sample(false, false, 516);
+    CHECK(!failed.BeginInstall(false) && failed.Panel(true, false) == PA::Unavailable,
+          "partial failed installation is never retried even during loading");
+    Gate fallback;
+    fallback.Sample(false, true, 0);
+    fallback.Sample(false, true, 500);
+    CHECK(fallback.BeginInstall(false), "loaded scene fallback handles skipped title");
+    fallback.CompleteInstall(true);
+    fallback.Sample(false, false, 516);
+    CHECK(fallback.Panel(true, false) == PA::Toggle, "fallback also latches across loading");
+    Gate unstable;
+    unstable.Sample(true, false, 0);
+    unstable.Sample(false, false, 499);
+    unstable.Sample(true, false, 500);
+    unstable.Sample(true, false, 999);
+    CHECK(!unstable.BeginInstall(false), "interrupted initial title sample resets timer");
 
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过（0 项失败）\n", g_fail);
     return g_fail ? 1 : 0;
